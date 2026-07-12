@@ -3227,16 +3227,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     // that severs the autodiff edge from k_cur/v_cur, so ggml_build_backward_expand aborts the
     // moment wk/wv (or anything upstream of them, i.e. any multi-layer LoRA) needs a gradient.
     // See llm_graph_context::build_attn.
-    cparams.training = true;
-
-    // Flash attention has no backward pass at this commit -- ggml_compute_backward has no case
-    // for GGML_OP_FLASH_ATTN_EXT -- so a training graph that used it would abort. Fall back to
-    // the unfused attention path, which is differentiable. Forcing it here, loudly, beats
-    // aborting deep inside graph construction with nothing to point at.
-    if (cparams.flash_attn) {
-        LLAMA_LOG_WARN("%s: disabling flash attention for training (no backward pass)\n", __func__);
-        cparams.flash_attn = false;
-    }
+    set_training(true);
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;
@@ -3269,6 +3260,134 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
             llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
         }
     }
+}
+
+void llama_context::set_training(bool value) {
+    cparams.training = value;
+
+    if (value && cparams.flash_attn) {
+        // FLASH_ATTN_EXT has no backward rule at this commit, so a training graph using it would
+        // abort inside ggml_build_backward_expand. Fall back to the unfused attention path, which
+        // is differentiable. Failing loudly here beats aborting deep in graph construction with
+        // nothing to point at.
+        LLAMA_LOG_WARN("%s: disabling flash attention for training (no backward pass)\n", __func__);
+        cparams.flash_attn = false;
+    }
+}
+
+// learning-llamas (S1-02). Structurally a fork of opt_epoch_iter below: same batch/ubatch
+// plumbing, same memory-context dance, same ggml_opt prepare/alloc/eval cycle. Two differences,
+// and they are the whole point:
+//
+//   1. the ggml_opt context is the CALLER's, so the caller chooses the loss type; and
+//   2. the loss node is BUILT BY THE CALLER from the logits, rather than being a hardcoded
+//      cross-entropy over dense one-hot labels with no way to mask tokens -- which is what makes
+//      the stock path unable to train an instruction-tuned model.
+//
+// Keeping this as a separate method, rather than adding parameters to opt_epoch_iter, leaves the
+// stock training path bit-for-bit unchanged.
+int32_t llama_context::opt_step_custom(
+        llama_batch        &      batch,
+        ggml_opt_context_t        opt_ctx_,
+        ggml_opt_result_t         result,
+        llama_build_loss_fn       build_loss,
+        llama_set_loss_inputs_fn  set_loss_inputs,
+        void *                    loss_ud,
+        bool                      train) {
+    if (opt_ctx_ == nullptr || build_loss == nullptr) {
+        LLAMA_LOG_ERROR("%s: opt_ctx and build_loss are required\n", __func__);
+        return -1;
+    }
+
+    // A training graph bypasses the KV cache (S1-00), so there is nothing to carry between steps.
+    memory->clear(true);
+
+    if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(),
+                      cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+        return -2;
+    }
+
+    const uint32_t n_tokens_all = balloc->get_n_tokens();
+
+    n_queued_tokens += n_tokens_all;
+    embd_seq.clear();
+
+    auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
+    if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: could not initialize the memory context\n", __func__);
+        return -3;
+    }
+
+    if (output_reserve(n_tokens_all) < n_tokens_all) {
+        LLAMA_LOG_ERROR("%s: could not reserve space for %u outputs\n", __func__, n_tokens_all);
+        return -4;
+    }
+
+    int32_t pos = 0;
+
+    do {
+        const auto & ubatch = mctx->get_ubatch();
+
+        n_outputs = ubatch.n_tokens;
+
+        if (!mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
+            return -5;
+        }
+
+        auto * res = gf_res_prev.get();
+
+        const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+
+        res->reset();
+
+        auto * gf = model.build_graph(gparams);
+
+        ggml_context * ctx_compute_opt;
+        {
+            const size_t size_gf   = ggml_graph_size(gf);
+            const size_t size_meta = 4*size_gf*ggml_tensor_overhead()
+                                   + 2*ggml_graph_overhead_custom(size_gf, /*grads =*/ true);
+            ggml_init_params ip = {
+                /*.mem_size   =*/ size_meta,
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ctx_compute_opt = ggml_init(ip);
+        }
+
+        // The caller turns the logits into a scalar loss. Because its opt_ctx uses
+        // GGML_OPT_LOSS_TYPE_SUM, ggml-opt sums this node -- and summing a scalar is the
+        // identity -- so the node it returns simply *is* the loss that gets differentiated.
+        ggml_tensor * loss = build_loss(ctx_compute_opt, gf, res->get_logits(),
+                                        pos, (int32_t) ubatch.n_tokens, loss_ud);
+        if (loss == nullptr || !ggml_is_scalar(loss)) {
+            LLAMA_LOG_ERROR("%s: build_loss must return a scalar tensor\n", __func__);
+            ggml_free(ctx_compute_opt);
+            return -6;
+        }
+
+        ggml_opt_prepare_alloc(opt_ctx_, ctx_compute_opt, gf, res->get_inp_tokens(), loss);
+        ggml_opt_alloc(opt_ctx_, train);
+
+        // Uploads the token ids and the attention mask.
+        res->set_inputs(&ubatch);
+
+        // ...and now the caller's loss inputs. This must happen HERE, not inside build_loss:
+        // those tensors had no memory until ggml_opt_alloc ran.
+        if (set_loss_inputs) {
+            set_loss_inputs(loss_ud);
+        }
+
+        ggml_opt_eval(opt_ctx_, result);
+
+        ggml_free(ctx_compute_opt);
+
+        pos += (int32_t) ubatch.n_tokens;
+    } while (mctx->next());
+
+    return 0;
 }
 
 void llama_context::opt_epoch_iter(
