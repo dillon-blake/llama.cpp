@@ -122,6 +122,16 @@ extern "C" {
 
         int32_t opt_period; // after how many gradient accumulation steps an optimizer step should be done
 
+        // Clip the gradients to this GLOBAL norm before the optimizer step. 0 disables it.
+        //
+        // Global, i.e. one norm over all parameters jointly -- not per-tensor -- which is what
+        // preserves the direction of the update and merely bounds its length.
+        //
+        // Applied as nodes in the graph, because it cannot be done anywhere else: the optimizer
+        // step is fused into the backward graph, so by the time a host callback could run, the
+        // weights have already moved. See ggml_opt_build.
+        float grad_clip;
+
         ggml_opt_get_optimizer_params get_opt_pars;    // callback for calculating optimizer parameters
         void *                        get_opt_pars_ud; // userdata for calculating optimizer parameters
 

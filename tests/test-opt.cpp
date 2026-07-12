@@ -969,6 +969,97 @@ static std::pair<int, int> test_dynamic_graph_opt_period(
     return std::make_pair(npass, ntest);
 }
 
+// Global-norm gradient clipping rescales the gradient and does not rotate it.
+//
+// The model is linear in the weights (loss = sum(x*w), so dL/dw = x), which makes the gradient known
+// exactly and independent of w -- so the clipped gradient can be predicted in closed form rather
+// than compared against another implementation of the same idea.
+//
+// x = [3, 4] has norm 5. With clip = 1, the update must be the SGD step on x/5 = [0.6, 0.8]:
+// same direction, length 1. With clip = 10 -- above the norm -- the gradient must pass through
+// completely untouched, which is the half of it that a "does the number get smaller" test misses.
+static std::pair<int, int> test_dynamic_graph_grad_clip(
+        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+    int npass = 0;
+    int ntest = 0;
+
+    if (optim != GGML_OPT_OPTIMIZER_TYPE_SGD) {
+        // SGD only: AdamW normalizes by sqrt(v), so it is very nearly INVARIANT to the scale of the
+        // gradient -- clipping it would barely move the weights differently, and a test on AdamW
+        // would pass whether the clip worked or not. SGD's step is the gradient, so the clip is
+        // directly visible in the weights. (The clip itself is optimizer-independent: it rewrites
+        // the gradient before either step node ever sees it.)
+        return std::make_pair(npass, ntest);
+    }
+
+    constexpr int64_t ne = 2;
+    const std::vector<float> x_data = {3.0f, 4.0f};  // norm 5
+    const float lr = 1.0f;
+
+    auto run = [&](float clip) {
+        ggml_context * ctx_static;
+        {
+            ggml_init_params params = {
+                /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ctx_static = ggml_init(params);
+        }
+
+        ggml_tensor * weights = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, ne);
+        ggml_set_name(weights, "weights");
+        ggml_set_param(weights);
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+
+        const std::vector<float> w_init(ne, 0.0f);
+        ggml_backend_tensor_set(weights, w_init.data(), 0, ne*sizeof(float));
+
+        ggml_opt_params opt_params = ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_SUM);
+        opt_params.ctx_compute     = nullptr;
+        opt_params.opt_period      = 1;
+        opt_params.grad_clip       = clip;
+        opt_params.optimizer       = optim;
+        opt_params.get_opt_pars    = helper_get_test_opt_pars;  // sgd.alpha = 1, wd = 0
+        ggml_opt_context_t opt_ctx = ggml_opt_init(opt_params);
+
+        helper_dynamic_step(opt_ctx, weights, x_data, /*backward =*/ true);
+
+        std::vector<float> w(ne);
+        ggml_backend_tensor_get(weights, w.data(), 0, ne*sizeof(float));
+
+        ggml_opt_free(opt_ctx);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx_static);
+
+        return w;
+    };
+
+    // w starts at 0 and SGD does w -= alpha * grad with alpha = 1, so w ends at -grad.
+    {
+        const std::vector<float> w = run(/*clip =*/ 1.0f);
+        const bool subtest_ok = almost_equal(w[0], -0.6, 1e-5) && almost_equal(w[1], -0.8, 1e-5);
+        print_ok(__func__, subtest_ok, npass, ntest, "clip 1: rescaled to unit norm, same direction");
+    }
+
+    {
+        const std::vector<float> w = run(/*clip =*/ 10.0f);
+        const bool subtest_ok = almost_equal(w[0], -3.0, 1e-5) && almost_equal(w[1], -4.0, 1e-5);
+        print_ok(__func__, subtest_ok, npass, ntest, "clip 10 (above the norm): gradient untouched");
+    }
+
+    {
+        const std::vector<float> w = run(/*clip =*/ 0.0f);
+        const bool subtest_ok = almost_equal(w[0], -3.0, 1e-5) && almost_equal(w[1], -4.0, 1e-5);
+        print_ok(__func__, subtest_ok, npass, ntest, "clip 0: disabled");
+    }
+
+    (void) lr;
+
+    return std::make_pair(npass, ntest);
+}
+
 // The gradient accumulators must be zeroed at the start of every step when the graphs are DYNAMIC.
 //
 // Every other test in this file passes opt_params.ctx_compute, i.e. builds the graph once and reuses
@@ -1113,6 +1204,11 @@ static std::pair<int, int> test_backend(
     }
     {
         std::pair<int, int> partial = test_dynamic_graph_opt_period(optim, backend_sched, backend);
+        npass += partial.first;
+        ntest += partial.second;
+    }
+    {
+        std::pair<int, int> partial = test_dynamic_graph_grad_clip(optim, backend_sched, backend);
         npass += partial.first;
         ntest += partial.second;
     }

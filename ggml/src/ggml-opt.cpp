@@ -61,6 +61,7 @@ struct ggml_opt_context {
 
     int64_t iter               = 1;
     int32_t opt_period         = 1;
+    float   grad_clip          = 0.0f;
     int32_t opt_i              = 0;
     bool    loss_per_datapoint = false;
 
@@ -253,6 +254,7 @@ struct ggml_opt_params ggml_opt_default_params(
         /*loss_type       =*/ loss_type,
         /*build_type      =*/ GGML_OPT_BUILD_TYPE_OPT,
         /*opt_period      =*/ 1,
+        /*grad_clip       =*/ 0.0f,
         /*get_opt_pars    =*/ ggml_opt_get_default_optimizer_params,
         /*get_opt_pars_ud =*/ nullptr,
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
@@ -508,11 +510,64 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_set_input(adamw_params);
     const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
     ggml_format_name(adamw_params, "%s_params", optimizer_name);
+
+    // Global-norm gradient clipping, as nodes in the graph rather than a pass over the host.
+    //
+    // It has to be in the graph. The optimizer step is not a separate phase -- it is a set of
+    // OPT_STEP_ADAMW nodes appended to the backward graph, and the whole thing runs in one
+    // ggml_backend_sched_graph_compute. So there is no host-visible moment "after the backward,
+    // before the step": by the time control returns, the weights have already moved. A host pass
+    // over the accumulators can only see the gradients from *earlier* micro-steps of an
+    // accumulation window, never the last one -- which is the one that triggers the step.
+    //
+    //     norm  = sqrt(sum_i sum(grad_i^2))          over ALL parameters, jointly
+    //     grad' = grad * clip / max(norm, clip)
+    //
+    // max(norm, clip) is ggml_clamp with clip as its lower bound, so the whole thing needs no
+    // extra tensor and no new op: `clip` is a build-time constant and lands in ggml_scale.
+    //
+    // Read it back: when norm < clip the factor is clip/clip = 1 and the gradient is untouched;
+    // when norm > clip it becomes clip/norm, which rescales the global norm to exactly clip; and
+    // when norm is 0 the denominator is still clip, so it yields 0 rather than a NaN.
+    struct ggml_tensor * clip_denom = nullptr;
+
+    if (opt_ctx->grad_clip > 0.0f) {
+        struct ggml_tensor * sumsq = nullptr;
+
+        for (int i = opt_ctx->gf->n_nodes-1; i >= 0; --i) {
+            struct ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
+            struct ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_opt, node);
+
+            if (!grad || !(node->flags & GGML_TENSOR_FLAG_PARAM)) {
+                continue;
+            }
+
+            struct ggml_tensor * s = ggml_sum(opt_ctx->ctx_compute, ggml_sqr(opt_ctx->ctx_compute, grad));
+            sumsq = sumsq ? ggml_add(opt_ctx->ctx_compute, sumsq, s) : s;
+        }
+
+        if (sumsq) {
+            struct ggml_tensor * norm = ggml_sqrt(opt_ctx->ctx_compute, sumsq);
+            ggml_set_name(norm, "grad_norm");
+
+            clip_denom = ggml_clamp(opt_ctx->ctx_compute, norm, opt_ctx->grad_clip, INFINITY);
+            ggml_set_name(clip_denom, "grad_clip_denom");
+        }
+    }
+
     for (int i = opt_ctx->gf->n_nodes-1; i >= 0; --i) {
         struct ggml_tensor * node = opt_ctx->gb_opt->nodes[i];
         struct ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_opt, node);
 
         if (grad && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
+            if (clip_denom) {
+                // The [1] denominator broadcasts across the parameter's shape.
+                grad = ggml_scale(opt_ctx->ctx_compute,
+                                  ggml_div(opt_ctx->ctx_compute, grad, clip_denom),
+                                  opt_ctx->grad_clip);
+                ggml_format_name(grad, "clipped grad for %s", node->name);
+            }
+
             struct ggml_tensor * m = nullptr;
             struct ggml_tensor * v = nullptr;
             if (need_momenta) {
@@ -556,6 +611,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->inputs           = params.inputs;
     result->outputs          = params.outputs;
     result->opt_period       = params.opt_period;
+    result->grad_clip        = params.grad_clip;
     result->get_opt_pars     = params.get_opt_pars;
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
     result->optimizer        = params.optimizer;
