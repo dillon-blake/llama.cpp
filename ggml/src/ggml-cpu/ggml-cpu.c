@@ -2854,7 +2854,12 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
-                        if (ggml_is_quantized(node->src[0]->type)) {
+                        // F16/BF16 src0 take the same dequantize-a-row-at-a-time path as the
+                        // quantized types, so they need the same per-thread F32 row buffer. Miss
+                        // this and the kernel writes past the end of the work buffer.
+                        if (ggml_is_quantized(node->src[0]->type) ||
+                            node->src[0]->type == GGML_TYPE_F16   ||
+                            node->src[0]->type == GGML_TYPE_BF16) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
                     } break;

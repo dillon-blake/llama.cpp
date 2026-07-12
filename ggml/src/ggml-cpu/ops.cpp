@@ -4485,10 +4485,22 @@ void ggml_compute_forward_out_prod(
                 ggml_compute_forward_out_prod_q_f32(params, dst);
             } break;
         case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
             {
-                GGML_ABORT("fatal error"); // todo
-                // ggml_compute_forward_out_prod_f16_f32(params, dst);
-            }
+                // Routed through the same dequantize-a-row-at-a-time path as the quantized types.
+                // It needs only to_float and ggml_type_size, both of which F16 and BF16 define --
+                // so "q_f32" is a misnomer for what the function actually requires, and there was
+                // never a reason for F16 to abort here.
+                //
+                // Accumulation stays F32 (ggml_vec_mad_f32), per the project's numerics policy:
+                // this is a gradient path.
+                //
+                // Note the old code had NO `break` after its GGML_ABORT. Anyone who simply deleted
+                // the abort would have fallen through into the F32 kernel and read F16 bytes as
+                // floats -- a silent wrong answer rather than a crash. That is the trap this
+                // replaces.
+                ggml_compute_forward_out_prod_q_f32(params, dst);
+            } break;
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_out_prod_f32(params, dst);
