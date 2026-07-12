@@ -1094,9 +1094,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "CROSS_ENTROPY_LOSS_SPARSE",
+    "CROSS_ENTROPY_LOSS_SPARSE_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1205,9 +1208,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "cross_entropy_loss_sparse(x,y,w)",
+    "cross_entropy_loss_sparse_back(x,y,w)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6155,6 +6161,68 @@ struct ggml_tensor * ggml_cross_entropy_loss_back(
     return result;
 }
 
+// ggml_cross_entropy_loss_sparse (ADR-0003)
+
+struct ggml_tensor * ggml_cross_entropy_loss_sparse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * labels,
+        struct ggml_tensor  * weights,
+        float                 logit_scale,
+        float                 softcap) {
+    GGML_ASSERT(ggml_is_matrix(logits));
+    GGML_ASSERT(logits->type  == GGML_TYPE_F32);
+    GGML_ASSERT(labels->type  == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+
+    // One label and one weight per token, i.e. per logits ROW.
+    GGML_ASSERT(ggml_nelements(labels)  == logits->ne[1]);
+    GGML_ASSERT(ggml_nelements(weights) == logits->ne[1]);
+
+    // Per-token loss, NOT reduced: a mean over all rows is the wrong statistic when some rows
+    // are masked, and no op-param can retrofit that. The caller reduces (ADR-0003 decision 1).
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, logits->ne[1]);
+
+    float params[] = { logit_scale, softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_CROSS_ENTROPY_LOSS_SPARSE;
+    result->src[0] = logits;
+    result->src[1] = labels;
+    result->src[2] = weights;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_cross_entropy_loss_sparse_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * dloss,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * labels,
+        struct ggml_tensor  * weights,
+        float                 logit_scale,
+        float                 softcap) {
+    GGML_ASSERT(ggml_is_matrix(logits));
+    GGML_ASSERT(ggml_nelements(dloss)   == logits->ne[1]);
+    GGML_ASSERT(ggml_nelements(labels)  == logits->ne[1]);
+    GGML_ASSERT(ggml_nelements(weights) == logits->ne[1]);
+
+    // A distinct dst, never a view of `logits` (ADR-0003 decision 3): an in-place result is a
+    // view, and ggml_build_backward_expand refuses views of non-whitelisted ops.
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, logits);
+
+    float params[] = { logit_scale, softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK;
+    result->src[0] = dloss;
+    result->src[1] = logits;
+    result->src[2] = labels;
+    result->src[3] = weights;
+
+    return result;
+}
+
 // opt_step_adamw
 
 struct ggml_tensor * ggml_opt_step_adamw(
@@ -6931,6 +6999,22 @@ static void ggml_compute_backward(
             }
             GGML_ASSERT(!src1_needs_grads && "backward pass for labels not implemented");
         } break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE: {
+            if (src0_needs_grads) {
+                float logit_scale;
+                float softcap;
+                memcpy(&logit_scale, (const float *) tensor->op_params + 0, sizeof(float));
+                memcpy(&softcap,     (const float *) tensor->op_params + 1, sizeof(float));
+
+                // `grad` is per-token here, not a scalar: the op returns a vector and the caller
+                // reduces it, so the reduction's own gradient arrives as one dloss per token.
+                ggml_add_or_set(ctx, cgraph, isrc0,
+                    ggml_cross_entropy_loss_sparse_back(ctx, grad, src0, src1, src2, logit_scale, softcap));
+            }
+            // Labels are token ids (I32) and weights are constants. Neither is differentiable.
+            GGML_ASSERT(!src1_needs_grads && "cross_entropy_loss_sparse: labels are not differentiable");
+            GGML_ASSERT(!src2_needs_grads && "cross_entropy_loss_sparse: weights are not differentiable");
+        } break;
         case GGML_OP_GLU: {
             switch (ggml_get_glu_op(tensor)) {
                 case GGML_GLU_OP_SWIGLU: {
@@ -7121,6 +7205,14 @@ void ggml_build_backward_expand(
             case GGML_OP_GET_ROWS_BACK: // same as for GET_ROWS
             case GGML_OP_ROPE:          // positions not differentiable
                 ignore_src[1] = true;
+                break;
+
+            case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE:
+                // src[1] is the I32 label ids and src[2] the constant loss weights: neither is
+                // differentiable. Being explicit here beats relying on the I32 skip, and it
+                // documents that masking a token is not a gradient path.
+                ignore_src[1] = true;
+                ignore_src[2] = true;
                 break;
 
             default:

@@ -586,6 +586,12 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // learning-llamas: sparse cross-entropy (ADR-0003). Appended at the TAIL of the table on
+        // purpose -- inserting in the middle renumbers every op after it and turns every rebase
+        // into a conflict across the whole backend matrix.
+        GGML_OP_CROSS_ENTROPY_LOSS_SPARSE,
+        GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK,
+
         GGML_OP_COUNT,
     };
 
@@ -2662,6 +2668,39 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // logits
             struct ggml_tensor  * b); // labels
+
+    // Sparse cross-entropy (ADR-0003).
+    //
+    //   logits:  F32 [n_vocab, n_tokens]
+    //   labels:  I32 [n_tokens]        -- target token id per position
+    //   weights: F32 [n_tokens]        -- per-token loss weight; 0 masks the token out
+    //   result:  F32 [n_tokens]        -- the per-token loss, NOT reduced
+    //
+    // The dense op takes an [n_vocab, n_tokens] one-hot label matrix -- 1 GB of zeros at a 128k
+    // vocab -- and mean-reduces over ALL rows, which gives no way to mask a token. This takes one
+    // integer per token and returns a vector, so the caller reduces it however it likes.
+    //
+    //   u = x * logit_scale
+    //   z = softcap > 0 ? softcap * tanh(u / softcap) : u
+    //   loss_i = w_i * (logsumexp_j(z_ij) - z_i[label_i])
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_sparse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * labels,
+            struct ggml_tensor  * weights,
+            float                 logit_scale,   // 1.0f = off
+            float                 softcap);      // 0.0f = off
+
+    // dloss: F32 [n_tokens] -- the gradient of the reduction w.r.t. each token's loss.
+    // result: F32 [n_vocab, n_tokens]
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_sparse_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * dloss,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * labels,
+            struct ggml_tensor  * weights,
+            float                 logit_scale,
+            float                 softcap);
 
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_back(
             struct ggml_context * ctx,

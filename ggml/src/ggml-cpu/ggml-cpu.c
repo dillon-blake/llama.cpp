@@ -2085,6 +2085,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_cross_entropy_loss(params, tensor);
             }
             break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE:
+            {
+                ggml_compute_forward_cross_entropy_loss_sparse(params, tensor);
+            }
+            break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK:
+            {
+                ggml_compute_forward_cross_entropy_loss_sparse_back(params, tensor);
+            }
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             {
                 ggml_compute_forward_cross_entropy_loss_back(params, tensor);
@@ -2438,6 +2448,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE:
+        case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             {
@@ -2958,6 +2970,18 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_CROSS_ENTROPY_LOSS:
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
+                    } break;
+                case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE:
+                    {
+                        // One scratch row of transformed logits per thread. Note the sparse op
+                        // needs NO per-thread partial-sum slot: unlike the dense op it does not
+                        // reduce, so there is nothing to sum across threads.
+                        cur = sizeof(float)*node->src[0]->ne[0]*n_tasks;
+                    } break;
+                case GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK:
+                    {
+                        // Same scratch row: the backward recomputes the LSE (ADR-0003).
+                        cur = sizeof(float)*node->src[1]->ne[0]*n_tasks;
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
