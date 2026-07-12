@@ -11590,3 +11590,205 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
             }
     }
 }
+
+// ggml_compute_forward_cross_entropy_loss_sparse (ADR-0003)
+
+// The transform applied to a logit before the softmax:
+//
+//     u = x * logit_scale
+//     z = softcap > 0 ? softcap * tanh(u / softcap) : u
+//
+// Kept in one place so the forward and the backward cannot drift apart -- if they disagree by so
+// much as an operation order, the gradient is wrong in a way finite differences will find but a
+// reader will not.
+static inline float ggml_ce_sparse_transform(float x, float logit_scale, float softcap) {
+    const float u = x * logit_scale;
+    return softcap > 0.0f ? softcap * tanhf(u / softcap) : u;
+}
+
+// Row-wise log-sum-exp of the transformed logits, written into `z`.
+//
+// Two passes (max, then sum of exp) rather than a chunked decomposition: on CPU the row is in
+// cache and this is both simpler and more accurate. Chunking exists to fit a GPU threadgroup's
+// shared memory, so it is a per-backend concern (ADR-0003, out of scope) -- the value computed is
+// identical either way.
+static float ggml_ce_sparse_row_lse(const float * x, float * z, int64_t nc,
+                                    float logit_scale, float softcap) {
+    float max = -INFINITY;
+    for (int64_t j = 0; j < nc; ++j) {
+        z[j] = ggml_ce_sparse_transform(x[j], logit_scale, softcap);
+        if (z[j] > max) {
+            max = z[j];
+        }
+    }
+
+    // F32 accumulation, per ADR-0002: this is a gradient path.
+    float sum = 0.0f;
+    for (int64_t j = 0; j < nc; ++j) {
+        sum += expf(z[j] - max);
+    }
+
+    return max + logf(sum);
+}
+
+static void ggml_compute_forward_cross_entropy_loss_sparse_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * logits  = dst->src[0];
+    const ggml_tensor * labels  = dst->src[1];
+    const ggml_tensor * weights = dst->src[2];
+
+    GGML_ASSERT(logits->type  == GGML_TYPE_F32);
+    GGML_ASSERT(labels->type  == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type     == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(logits));
+
+    float logit_scale;
+    float softcap;
+    memcpy(&logit_scale, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&softcap,     (const float *) dst->op_params + 1, sizeof(float));
+
+    const int64_t nc = logits->ne[0];  // n_vocab
+    const int64_t nr = logits->ne[1];  // n_tokens
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // One scratch row of transformed logits per thread.
+    float * z = (float *) params->wdata + (size_t) ith * nc;
+    GGML_ASSERT(params->wsize >= sizeof(float) * nc * nth);
+
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    const int32_t * label_ids = (const int32_t *) labels->data;
+    const float   * w         = (const float   *) weights->data;
+    float         * loss      = (float         *) dst->data;
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const float * x = (const float *) ((const char *) logits->data + i*logits->nb[1]);
+
+        if (w[i] == 0.0f) {
+            // A masked token contributes exactly nothing. Do not compute-then-scale: a saturated
+            // exp or an all -inf row makes the loss inf/NaN, and 0 * NaN is NaN, not 0.
+            loss[i] = 0.0f;
+            continue;
+        }
+
+        const int32_t label = label_ids[i];
+        GGML_ASSERT(label >= 0 && label < nc);
+
+        const float lse = ggml_ce_sparse_row_lse(x, z, nc, logit_scale, softcap);
+
+        loss[i] = w[i] * (lse - z[label]);
+    }
+}
+
+void ggml_compute_forward_cross_entropy_loss_sparse(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_cross_entropy_loss_sparse_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_cross_entropy_loss_sparse_back
+
+static void ggml_compute_forward_cross_entropy_loss_sparse_back_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * dloss   = dst->src[0];
+    const ggml_tensor * logits  = dst->src[1];
+    const ggml_tensor * labels  = dst->src[2];
+    const ggml_tensor * weights = dst->src[3];
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_is_contiguous(logits));
+    GGML_ASSERT(ggml_are_same_shape(logits, dst));
+
+    float logit_scale;
+    float softcap;
+    memcpy(&logit_scale, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&softcap,     (const float *) dst->op_params + 1, sizeof(float));
+
+    const int64_t nc = logits->ne[0];
+    const int64_t nr = logits->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // The LSE is recomputed here rather than stashed by the forward (ADR-0003 decision 2): ggml
+    // has no clean multi-output op, and this kernel is already streaming the whole row to write
+    // dlogits into it.
+    float * z = (float *) params->wdata + (size_t) ith * nc;
+    GGML_ASSERT(params->wsize >= sizeof(float) * nc * nth);
+
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    const float   * dl        = (const float   *) dloss->data;
+    const int32_t * label_ids = (const int32_t *) labels->data;
+    const float   * w         = (const float   *) weights->data;
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const float * x  = (const float *) ((const char *) logits->data + i*logits->nb[1]);
+        float       * dx = (float       *) ((char       *) dst->data    + i*dst->nb[1]);
+
+        if (w[i] == 0.0f) {
+            // BITWISE zero, not a computed zero (ADR-0003 decision 4). `p - onehot` can be inf or
+            // NaN for extreme logits, and 0 * NaN is NaN -- one masked row with a degenerate
+            // logit would poison the entire gradient.
+            memset(dx, 0, nc*sizeof(float));
+            continue;
+        }
+
+        const int32_t label = label_ids[i];
+        GGML_ASSERT(label >= 0 && label < nc);
+
+        const float lse   = ggml_ce_sparse_row_lse(x, z, nc, logit_scale, softcap);
+        const float coeff = dl[i] * w[i];
+
+        for (int64_t j = 0; j < nc; ++j) {
+            // dL/dz = dloss * w * (softmax - onehot)
+            const float p  = expf(z[j] - lse);
+            float       g  = coeff * (p - (j == label ? 1.0f : 0.0f));
+
+            // Chain back through the softcap: z = c*tanh(u/c), so dz/du = 1 - tanh^2(u/c), and
+            // tanh(u/c) is just z/c -- no second tanh needed.
+            if (softcap > 0.0f) {
+                const float t = z[j] / softcap;
+                g *= 1.0f - t*t;
+            }
+
+            // ...and through the scale: u = x * logit_scale.
+            dx[j] = g * logit_scale;
+        }
+    }
+}
+
+void ggml_compute_forward_cross_entropy_loss_sparse_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_cross_entropy_loss_sparse_back_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
