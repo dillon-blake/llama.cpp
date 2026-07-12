@@ -2038,7 +2038,8 @@ struct test_unary : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const bool grad_supported = op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_NEG ||
             op == GGML_UNARY_OP_STEP || op == GGML_UNARY_OP_RELU || op == GGML_UNARY_OP_SILU ||
-            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS;
+            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS ||
+            op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_SIGMOID;
 
         ggml_tensor * a;
         if (v & 1) {
@@ -4677,6 +4678,10 @@ struct test_clamp : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        // Without this, MODE_GRAD checks NOTHING: eval_grad only differentiates a graph that has
+        // a parameter in it. This test already declared grad_eps() and grad_expect() below, as if
+        // it were being gradient-checked -- it was not.
+        ggml_set_param(a);
         ggml_set_name(a, "a");
 
         ggml_tensor * out = ggml_clamp(ctx, a, min, max);
@@ -4690,6 +4695,9 @@ struct test_clamp : public test_case {
     }
 
     std::vector<float> grad_expect() override {
+        // The gradient is exactly 0 outside [min, max] and exactly 1 inside, so a
+        // finite-difference estimate that straddles a bound lands somewhere in between and is
+        // simply wrong. Filtering to the two expected values is the right fix, not a looser bound.
         return {0.0f, 1.0f};
     }
 };

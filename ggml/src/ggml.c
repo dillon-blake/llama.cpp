@@ -4409,8 +4409,18 @@ struct ggml_tensor * ggml_clamp(
         struct ggml_tensor  * a,
         float                 min,
         float                 max) {
-    // TODO: when implement backward, fix this:
-    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+    // This used to be a ggml_view_tensor(ctx, a) -- an in-place op -- behind the in-tree
+    // "TODO: when implement backward, fix this". CLAMP now has a backward rule, so it is fixed.
+    //
+    // The TODO understated the problem. An in-place op's result is a VIEW of its source, so it
+    // overwrites the very input its backward pass needs, and ggml_build_backward_expand rejects
+    // it outright ("inplace operations are currently not supported"). A clamp whose gradient
+    // anyone asked for would have ABORTED -- not silently produced a wrong number.
+    //
+    // Allocating the destination costs one tensor's worth of memory and makes the op
+    // differentiable. Forward results are numerically identical: the CPU kernel already reads
+    // src0 and writes dst through separate pointers, so aliasing was never load-bearing.
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
 
     float params[] = { min, max };
     ggml_set_op_params(result, params, sizeof(params));
@@ -6869,11 +6879,50 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_sigmoid(ctx, src0)));
                     }
                 } break;
+                case GGML_UNARY_OP_TANH: {
+                    if (src0_needs_grads) {
+                        // d/dx tanh(x) = 1 - tanh(x)^2. `tensor` is already tanh(x), so reuse it
+                        // rather than recomputing: cheaper, and exactly consistent with the
+                        // forward value that was actually produced.
+                        ggml_add_or_set(ctx, cgraph, isrc0,
+                            ggml_mul(ctx, grad, ggml_scale_bias(ctx, ggml_sqr(ctx, tensor), -1.0f, 1.0f)));
+                    }
+                } break;
+                case GGML_UNARY_OP_SIGMOID: {
+                    if (src0_needs_grads) {
+                        // d/dx sigmoid(x) = y*(1-y) = y - y^2, with y = sigmoid(x) = `tensor`.
+                        ggml_add_or_set(ctx, cgraph, isrc0,
+                            ggml_mul(ctx, grad, ggml_sub(ctx, tensor, ggml_sqr(ctx, tensor))));
+                    }
+                } break;
                 default: {
                     fprintf(stderr, "%s: unsupported unary op for backward pass: %s\n",
                         __func__, ggml_unary_op_name(ggml_get_unary_op(tensor)));
                     GGML_ABORT("fatal error");
                 } //break;
+            }
+        } break;
+        case GGML_OP_CLAMP: {
+            if (src0_needs_grads) {
+                // d/dx clamp(x, min, max) = 1 strictly inside (min, max), and 0 elsewhere.
+                //
+                // Built from two steps: step(x - min) is 1 for x > min, and step(max - x) is 1
+                // for x < max. Their product is the indicator of the open interval.
+                //
+                // ggml_step(0) == 0, so the gradient is exactly zero AT the bounds as well as
+                // outside them. That is the standard subgradient convention for a clamp, and it
+                // is the choice a finite-difference check will agree with once the discontinuity
+                // is filtered out (expected-value filtering, test-backend-ops.cpp:319-321).
+                float min;
+                float max;
+                memcpy(&min, (const float *) tensor->op_params + 0, sizeof(float));
+                memcpy(&max, (const float *) tensor->op_params + 1, sizeof(float));
+
+                struct ggml_tensor * above_min = ggml_step(ctx, ggml_scale_bias(ctx, src0,  1.0f, -min));
+                struct ggml_tensor * below_max = ggml_step(ctx, ggml_scale_bias(ctx, src0, -1.0f,  max));
+
+                ggml_add_or_set(ctx, cgraph, isrc0,
+                    ggml_mul(ctx, ggml_mul(ctx, grad, above_min), below_max));
             }
         } break;
         case GGML_OP_CROSS_ENTROPY_LOSS: {
