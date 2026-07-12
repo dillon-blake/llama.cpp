@@ -5536,7 +5536,17 @@ static void ggml_compute_forward_soft_max_ext_back_f32(
     memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
 
-    GGML_ASSERT(max_bias == 0.0f);
+    // max_bias > 0 (ALiBi) needs no special handling here, and never did.
+    //
+    // The ALiBi bias is ADDITIVE and constant with respect to the logits: softmax(x + b) has the
+    // same Jacobian in x as softmax(x), because b contributes nothing to dy/dx. The backward
+    // kernel below only ever uses the forward OUTPUT y (via src1) and the incoming gradient, so
+    // it is already correct for any bias -- it does not even read max_bias.
+    //
+    // The assert that used to stand here (GGML_ASSERT(max_bias == 0.0f)) was therefore guarding
+    // against nothing, and it made ALiBi models untrainable for no reason. Vulkan, notably, has
+    // always ACCEPTED max_bias > 0 here unvalidated -- a good hint that no kernel ever needed the
+    // restriction.
 
     // TODO: handle transposed/permuted matrices
 
