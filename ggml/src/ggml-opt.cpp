@@ -724,9 +724,24 @@ void ggml_opt_prepare_alloc(
 
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     GGML_ASSERT(!opt_ctx->eval_ready);
-    if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
+
+    // Is this backward pass the first of a new gradient-accumulation window? If so, the previous
+    // window's gradients have already been consumed by an optimizer step, and the accumulators must
+    // be zeroed before anything adds to them.
+    //
+    // The window is tracked by opt_i, not by the previous build_type: a forward-only eval (a
+    // validation pass) leaves build_type == FORWARD behind, and keying off that would silently skip
+    // the reset on the next training step.
+    const bool new_accumulation_window = backward && opt_ctx->opt_i == 0;
+
+    // Static graphs: reset here, while gb_grad is still alive from the previous eval.
+    //
+    // opt_period == 1 needs no reset because ggml_opt_build then clears `accumulate` and the
+    // backward pass WRITES each gradient instead of adding to it.
+    if (opt_ctx->static_graphs && new_accumulation_window && opt_ctx->opt_period > 1) {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
+
     if (backward) {
         const int32_t opt_i_next = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
         opt_ctx->build_type = opt_i_next == 0 ? GGML_OPT_BUILD_TYPE_OPT : GGML_OPT_BUILD_TYPE_GRAD;
@@ -736,6 +751,23 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     if (!opt_ctx->static_graphs) {
         ggml_opt_build(opt_ctx);
+
+        // Dynamic graphs: reset AFTER the build, because ggml_opt_eval nulled gb_grad when it
+        // returned and the build is what recreates it.
+        //
+        // The reset is needed at EVERY opt_period, not just opt_period > 1: ggml_opt_build forces
+        // `accumulate` on whenever the graphs are dynamic, so the backward pass always adds to the
+        // accumulators rather than writing them. Without this, they are zeroed on the first build
+        // and never again -- every step's gradient is added to the running sum of every previous
+        // step's, and the optimizer descends on that sum. The loss still falls, which is what makes
+        // it so quiet.
+        //
+        // Reset gb_grad and not gb_opt: ggml_graph_reset also zeroes the AdamW moments of any
+        // OPT_STEP_ADAMW node it walks, and those must survive across steps. gb_grad has no such
+        // node, and both graphs share the same accumulator tensors.
+        if (new_accumulation_window) {
+            ggml_graph_reset(opt_ctx->gb_grad);
+        }
     }
 
     struct ggml_cgraph * graph = nullptr;
