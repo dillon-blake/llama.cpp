@@ -216,6 +216,62 @@ struct llama_context {
             int64_t                          ndata_in_loop,
             int64_t                          t_loop_start);
 
+    // -----------------------------------------------------------------------
+    // learning-llamas (S1-02): a training step with a caller-supplied loss.
+    // -----------------------------------------------------------------------
+    //
+    // opt_epoch_iter above hardcodes GGML_OPT_LOSS_TYPE_CROSS_ENTROPY over dense one-hot labels
+    // and offers no way to *mask* tokens. That makes it unable to train an instruction-tuned
+    // model, where the prompt must not contribute to the loss -- the single most common thing
+    // anyone wants to do. It also owns the ggml_opt context, so a caller cannot choose the loss
+    // type.
+    //
+    // opt_step_custom hands the graph's logits to the caller and lets it build whatever scalar
+    // loss it wants, on a caller-owned ggml_opt context.
+    //
+    // The caller's opt_ctx must have been created with GGML_OPT_LOSS_TYPE_SUM. ggml-opt then
+    // sums whatever tensor is handed to it as `outputs` -- and summing a scalar is the identity,
+    // so the caller's node simply *is* the loss. No ggml change is needed to make the loss
+    // pluggable.
+    //
+    // build_loss is called once per ubatch, after the forward graph is built and before
+    // ggml_opt_prepare_alloc. It must return a SCALAR node, and must expand it into `gf`.
+
+    typedef ggml_tensor * (*llama_build_loss_fn)(
+            ggml_context * ctx_compute,   // scratch context for the loss nodes
+            ggml_cgraph  * gf,            // the forward graph; expand the loss into it
+            ggml_tensor  * logits,        // [n_vocab, n_ubatch]
+            int32_t        pos,           // index of this ubatch's first token within the batch
+            int32_t        n_ubatch,      // tokens in this ubatch
+            void         * userdata);
+
+    // Called after ggml_opt_alloc has allocated the graph, and before it is evaluated.
+    //
+    // This hook exists because of an ordering constraint that is easy to get wrong: the tensors
+    // build_loss creates (target ids, per-token weights) have no memory until ggml_opt_alloc
+    // runs. So the caller CANNOT upload their contents from inside build_loss -- it must stash
+    // the tensor pointers there and fill them here.
+    typedef void (*llama_set_loss_inputs_fn)(void * userdata);
+
+    // Run one forward (+ backward + optimizer step, if `train`) over `batch`.
+    //
+    // Returns 0 on success, or a negative value on failure.
+    int32_t opt_step_custom(
+            llama_batch        &      batch,
+            ggml_opt_context_t        opt_ctx,
+            ggml_opt_result_t         result,
+            llama_build_loss_fn       build_loss,
+            llama_set_loss_inputs_fn  set_loss_inputs,
+            void *                    loss_ud,
+            bool                      train);
+
+    // Put the context into training mode without going through llama_opt_init.
+    //
+    // Training graphs must bypass the KV cache (S1-00), and that decision is made from
+    // cparams.training at graph-build time. A caller that owns its own ggml_opt context -- as
+    // the learning-llamas shim does, so that it can choose the loss -- still needs to set this.
+    void set_training(bool value);
+
 private:
     //
     // output
