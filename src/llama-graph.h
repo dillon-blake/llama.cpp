@@ -773,6 +773,9 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            // changes the attention topology (KV cache bypassed), so a training graph and an
+            // inference graph are never interchangeable
+            cparams.training                == other.cparams.training                &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

@@ -95,6 +95,7 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
+    cparams.training                = false; // set by opt_init
 
     cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
     embd_layer_inp.resize(hparams.n_layer());
@@ -3220,6 +3221,22 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
     GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
+
+    // From here on this context builds TRAINING graphs, which must bypass the KV cache:
+    // attention writes K/V into it with ggml_set_rows and reads them back through a view, and
+    // that severs the autodiff edge from k_cur/v_cur, so ggml_build_backward_expand aborts the
+    // moment wk/wv (or anything upstream of them, i.e. any multi-layer LoRA) needs a gradient.
+    // See llm_graph_context::build_attn.
+    cparams.training = true;
+
+    // Flash attention has no backward pass at this commit -- ggml_compute_backward has no case
+    // for GGML_OP_FLASH_ATTN_EXT -- so a training graph that used it would abort. Fall back to
+    // the unfused attention path, which is differentiable. Forcing it here, loudly, beats
+    // aborting deep inside graph construction with nothing to point at.
+    if (cparams.flash_attn) {
+        LLAMA_LOG_WARN("%s: disabling flash attention for training (no backward pass)\n", __func__);
+        cparams.flash_attn = false;
+    }
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;

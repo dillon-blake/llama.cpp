@@ -403,6 +403,75 @@ static void print_mask(const T * data, int64_t n_tokens, int64_t n_kv, int64_t n
     }
 }
 
+// Fill a [n_tokens, n_tokens] attention mask straight from the ubatch, with no KV cache
+// involved: entry (i0, i1) is 0 where token i1 may attend to token i0 and -INF where it may not.
+//
+// Two callers share this. llm_graph_input_attn_no_cache uses it always. llm_graph_input_attn_kv
+// uses it when cparams.training, because a training graph bypasses the KV cache entirely (see
+// llm_graph_context::build_attn) and therefore needs the no-cache mask *shape* to match the
+// no-cache K/V it attends over. Getting one without the other is a shape mismatch in
+// build_attn_mha, which is why they are changed together.
+//
+// Note this honors cparams.causal_attn: "no cache" does not mean "not causal".
+static void fill_kq_mask_no_cache(
+              ggml_tensor * mask,
+        const llama_ubatch * ubatch,
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+                        int   n_swa,
+             llama_swa_type   swa_type,
+                       bool   debug) {
+    const int64_t n_kv     = ubatch->n_tokens;
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    const auto fill = [&](auto * data, int64_t ne) {
+        using T = std::remove_reference_t<decltype(*data)>;
+        std::fill(data, data + ne, llama_cast<T>(-INFINITY));
+
+        for (int i1 = 0; i1 < n_tokens; ++i1) {
+            const llama_seq_id s1 = ubatch->seq_id[i1][0];
+            const llama_pos    p1 = ubatch->pos[i1];
+
+            const uint64_t idst = i1*n_kv;
+
+            for (int i0 = 0; i0 < n_tokens; ++i0) {
+                const llama_seq_id s0 = ubatch->seq_id[i0][0];
+                const llama_pos p0    = ubatch->pos[i0];
+
+                // mask different sequences
+                if (s0 != s1) {
+                    continue;
+                }
+
+                // mask future tokens
+                if (cparams.causal_attn && p0 > p1) {
+                    continue;
+                }
+
+                // apply SWA if any
+                if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                    continue;
+                }
+
+                data[idst + i0] = llama_cast<T>(hparams.use_alibi ? -std::abs(p0 - p1) : 0.0f);
+            }
+        }
+
+        if (debug) {
+            print_mask(data, n_tokens, n_kv, n_swa, swa_type);
+        }
+    };
+
+    GGML_ASSERT(mask);
+    GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
+
+    if (mask->type == GGML_TYPE_F16) {
+        fill((ggml_fp16_t *) mask->data, ggml_nelements(mask));
+    } else {
+        fill((float *) mask->data, ggml_nelements(mask));
+    }
+}
+
 void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     const int64_t n_kv     = ubatch->n_tokens;
     const int64_t n_tokens = ubatch->n_tokens;
@@ -465,6 +534,17 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
+    if (cparams.training) {
+        // No cache slots were indexed and no K/V was written, so there is nothing to upload but
+        // the mask -- and it is the no-cache one, matching the K/V build_attn actually attends
+        // over. See fill_kq_mask_no_cache.
+        if (self_kq_mask && self_kq_mask->buffer) {
+            fill_kq_mask_no_cache(self_kq_mask, ubatch, hparams, cparams,
+                                  0, LLAMA_SWA_TYPE_NONE, debug);
+        }
+        return;
+    }
+
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
@@ -2605,10 +2685,22 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
 
-        inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
-        inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+        if (cparams.training) {
+            // Training bypasses the KV cache (see build_attn), so there are no cache slots to
+            // index into and the mask spans the ubatch's own tokens rather than n_kv.
+            // self_k_idxs / self_v_idxs stay null; set_input skips them.
+            const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+            inp->self_kq_mask = ggml_new_tensor_4d(ctx0, type, ubatch.n_tokens, ubatch.n_tokens, 1, 1);
+            ggml_set_input(inp->self_kq_mask);
+            ggml_set_name(inp->self_kq_mask, "attn_inp_kq_mask_training");
+        } else {
+            inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
+            inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        }
+
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
@@ -2659,20 +2751,45 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
-    // store to KV cache
-    {
-        const auto & k_idxs = inp->get_k_idxs();
-        const auto & v_idxs = inp->get_v_idxs();
-
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
-    }
-
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = nullptr;
+    ggml_tensor * v = nullptr;
+
+    if (cparams.training) {
+        // THE TRAINING PATH: attend over k_cur/v_cur directly, with no KV cache.
+        //
+        // The cache is not merely an optimization here, it is fatal. Writing K/V into it is a
+        // ggml_set_rows, whose result is a *view* of the cache buffer (ggml.c), and attention
+        // then reads that buffer back through get_k()/get_v() -- two more views. So there is no
+        // autodiff edge from k_cur/v_cur to the attention output at all: the gradient of the
+        // loss w.r.t. wk/wv cannot flow. ggml_build_backward_expand does not silently produce a
+        // wrong gradient; it aborts on the SET_ROWS node ("inplace operations are currently not
+        // supported"), which is why upstream's own llama-finetune dies before printing a loss.
+        //
+        // Skipping the cache is sound for training because a training ubatch attends only over
+        // itself -- there is no prefix to reuse and no incremental decode. The mask that
+        // build_attn_inp_kv_impl built is the [n_tokens, n_tokens] no-cache one, so the shapes
+        // line up, and it still honors cparams.causal_attn.
+        //
+        // The cost is that attention is O(n_tokens^2) with no cache reuse, which is exactly what
+        // training does anyway.
+        k = k_cur;
+        v = v_cur;
+    } else {
+        // store to KV cache
+        {
+            const auto & k_idxs = inp->get_k_idxs();
+            const auto & v_idxs = inp->get_v_idxs();
+
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        }
+
+        k = mctx_cur->get_k(ctx0, il);
+        v = mctx_cur->get_v(ctx0, il);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
