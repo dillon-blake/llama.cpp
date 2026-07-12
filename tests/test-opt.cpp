@@ -839,6 +839,136 @@ static std::pair<int, int> test_regression(
     return std::make_pair(npass, ntest);
 }
 
+// One step of a DYNAMIC-graph optimization of loss = sum(x * w), rebuilding the graph as
+// llama_context does. Deliberately linear in the weights, so dL/dw = x no matter what w is.
+//
+// If grad_acc_out is given it is filled from ggml_opt_grad_acc BETWEEN alloc and eval, which is the
+// only window in which that is meaningful: ggml_opt_eval nulls the graphs it looks them up in when
+// the graphs are dynamic. The tensor itself lives in opt_ctx's static context and outlives the step.
+static void helper_dynamic_step(
+        ggml_opt_context_t opt_ctx, ggml_tensor * weights, const std::vector<float> & x_data,
+        bool backward, ggml_tensor ** grad_acc_out = nullptr) {
+    const int64_t ne = ggml_nelements(weights);
+
+    ggml_context * ctx_compute;
+    {
+        // ggml_opt_build dups the forward graph into this same context twice more -- once for the
+        // backward and once for the optimizer step -- so size it for all three.
+        ggml_init_params params = {
+            /*.mem_size   =*/ 1024*ggml_tensor_overhead() + 8*ggml_graph_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_compute = ggml_init(params);
+    }
+
+    ggml_tensor * inputs = ggml_new_tensor_1d(ctx_compute, GGML_TYPE_F32, ne);
+    ggml_set_input(inputs);
+
+    ggml_tensor * outputs = ggml_mul(ctx_compute, inputs, weights);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx_compute);
+    ggml_build_forward_expand(gf, outputs);
+
+    ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
+    ggml_opt_alloc(opt_ctx, backward);
+
+    ggml_backend_tensor_set(inputs, x_data.data(), 0, ne*sizeof(float));
+
+    if (grad_acc_out) {
+        *grad_acc_out = ggml_opt_grad_acc(opt_ctx, weights);
+    }
+
+    ggml_opt_eval(opt_ctx, nullptr);
+
+    ggml_free(ctx_compute);
+}
+
+// A forward-only eval must not advance the gradient-accumulation window.
+//
+// opt_i counts micro-batches within a window; the optimizer steps when it wraps to 0. A validation
+// pass computes no gradient and accumulates nothing, so consuming a slot for it means that with
+// opt_period == 2, "train, validate, train" leaves opt_i at 1 instead of 0 -- the second train step
+// builds a GRAD graph rather than an OPT one, and THE OPTIMIZER NEVER STEPS. The loss curve goes
+// flat and nothing says why.
+//
+// This also covers dynamic graphs with opt_period > 1 at all, which nothing else did: the reset in
+// ggml_opt_alloc used to run `ggml_graph_reset(gb_grad)` before the build, and with dynamic graphs
+// gb_grad is NULL at that point, so it was a null dereference.
+static std::pair<int, int> test_dynamic_graph_opt_period(
+        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+    int npass = 0;
+    int ntest = 0;
+
+    constexpr int64_t ne = 4;
+
+    ggml_context * ctx_static;
+    {
+        ggml_init_params params = {
+            /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_static = ggml_init(params);
+    }
+
+    ggml_tensor * weights = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, ne);
+    ggml_set_name(weights, "weights");
+    ggml_set_param(weights);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+
+    const std::vector<float> w_init(ne, 1.0f);
+    ggml_backend_tensor_set(weights, w_init.data(), 0, ne*sizeof(float));
+
+    ggml_opt_params opt_params = ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_SUM);
+    opt_params.ctx_compute = nullptr;  // dynamic graphs
+    opt_params.opt_period  = 2;        // two micro-batches per optimizer step
+    opt_params.optimizer   = optim;
+    ggml_opt_context_t opt_ctx = ggml_opt_init(opt_params);
+
+    const std::vector<float> x_data = {1.0f, 2.0f, 3.0f, 4.0f};
+
+    auto read_weights = [&]() {
+        std::vector<float> w(ne);
+        ggml_backend_tensor_get(weights, w.data(), 0, ne*sizeof(float));
+        return w;
+    };
+
+    auto changed = [&](const std::vector<float> & a, const std::vector<float> & b) {
+        for (int64_t i = 0; i < ne; ++i) {
+            if (!almost_equal(a[i], b[i], 1e-6)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Window 1: accumulate, then step.
+    std::vector<float> w0 = read_weights();
+    helper_dynamic_step(opt_ctx, weights, x_data, /*backward =*/ true);
+    print_ok(__func__, !changed(w0, read_weights()), npass, ntest, "micro-batch 1 does not step");
+
+    helper_dynamic_step(opt_ctx, weights, x_data, /*backward =*/ true);
+    std::vector<float> w1 = read_weights();
+    print_ok(__func__, changed(w0, w1), npass, ntest, "micro-batch 2 steps");
+
+    // Window 2, with a validation pass wedged into the middle of it.
+    helper_dynamic_step(opt_ctx, weights, x_data, /*backward =*/ true);
+    helper_dynamic_step(opt_ctx, weights, x_data, /*backward =*/ false);  // <-- validation
+    print_ok(__func__, !changed(w1, read_weights()), npass, ntest, "a forward-only eval does not step");
+
+    helper_dynamic_step(opt_ctx, weights, x_data, /*backward =*/ true);
+    print_ok(__func__, changed(w1, read_weights()), npass, ntest,
+             "the window still closes after a forward-only eval");
+
+    ggml_opt_free(opt_ctx);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx_static);
+
+    return std::make_pair(npass, ntest);
+}
+
 // The gradient accumulators must be zeroed at the start of every step when the graphs are DYNAMIC.
 //
 // Every other test in this file passes opt_params.ctx_compute, i.e. builds the graph once and reuses
@@ -892,45 +1022,12 @@ static std::pair<int, int> test_dynamic_graph_grad_reset(
     std::vector<std::vector<float>> grads;
 
     for (int step = 0; step < 2; ++step) {
-        ggml_context * ctx_compute;
-        {
-            // ggml_opt_build dups the forward graph into this same context twice more -- once for
-            // the backward and once for the optimizer step -- so size it for all three, not just
-            // the handful of tensors built below.
-            ggml_init_params params = {
-                /*.mem_size   =*/ 1024*ggml_tensor_overhead() + 8*ggml_graph_overhead(),
-                /*.mem_buffer =*/ nullptr,
-                /*.no_alloc   =*/ true,
-            };
-            ctx_compute = ggml_init(params);
-        }
-
-        ggml_tensor * inputs = ggml_new_tensor_1d(ctx_compute, GGML_TYPE_F32, ne);
-        ggml_set_input(inputs);
-
-        ggml_tensor * outputs = ggml_mul(ctx_compute, inputs, weights);
-
-        ggml_cgraph * gf = ggml_new_graph(ctx_compute);
-        ggml_build_forward_expand(gf, outputs);
-
-        ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
-        ggml_opt_alloc(opt_ctx, /*backward =*/ true);
-
-        ggml_backend_tensor_set(inputs, x_data.data(), 0, ne*sizeof(float));
-
-        // Grab the accumulator HERE. ggml_opt_eval nulls gb_opt on the way out when the graphs are
-        // dynamic (the caller is expected to free the compute context they live in), so
-        // ggml_opt_grad_acc is only meaningful between alloc and eval. The tensor it returns lives
-        // in opt_ctx's own static context and outlives the step.
-        ggml_tensor * grad_acc = ggml_opt_grad_acc(opt_ctx, weights);
-
-        ggml_opt_eval(opt_ctx, nullptr);
+        ggml_tensor * grad_acc = nullptr;
+        helper_dynamic_step(opt_ctx, weights, x_data, /*backward =*/ true, &grad_acc);
 
         std::vector<float> g(ne);
         ggml_backend_tensor_get(grad_acc, g.data(), 0, ne*sizeof(float));
         grads.push_back(g);
-
-        ggml_free(ctx_compute);
     }
 
     {
@@ -1011,6 +1108,11 @@ static std::pair<int, int> test_backend(
     }
     {
         std::pair<int, int> partial = test_dynamic_graph_grad_reset(optim, backend_sched, backend);
+        npass += partial.first;
+        ntest += partial.second;
+    }
+    {
+        std::pair<int, int> partial = test_dynamic_graph_opt_period(optim, backend_sched, backend);
         npass += partial.first;
         ntest += partial.second;
     }
