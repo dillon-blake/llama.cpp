@@ -461,7 +461,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_GET_ROWS_BACK:
             return src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16;
         case GGML_OP_OUT_PROD:
-            return (src0->type == GGML_TYPE_F32 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
+            // F16/BF16 src0 go through the same dequantize-per-row path as the quantized types
+            // (they define to_float too), under the same broadcast conditions.
+            return (src0->type == GGML_TYPE_F32 ||
+                    ((ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
+                     src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         default:
             return true;
