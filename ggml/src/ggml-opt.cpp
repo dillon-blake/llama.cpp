@@ -855,7 +855,18 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
 
     ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
     opt_ctx->iter += opt_ctx->allocated_graph == opt_ctx->gb_opt;
-    opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
+
+    // Only a BACKWARD eval advances the gradient-accumulation window.
+    //
+    // opt_i counts micro-batches within one accumulation window: the optimizer steps when it wraps
+    // to 0. A forward-only eval -- a validation pass -- computes no gradient and accumulates
+    // nothing, so advancing opt_i for it silently consumes a slot in the window. With
+    // opt_period == 2, "train, validate, train" then leaves opt_i at 1 rather than 0, so the second
+    // train step builds a GRAD graph instead of an OPT one and THE OPTIMIZER NEVER STEPS. The loss
+    // curve simply goes flat, and nothing says why.
+    if (opt_ctx->build_type != GGML_OPT_BUILD_TYPE_FORWARD) {
+        opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
+    }
 
     if (!opt_ctx->static_graphs) {
         opt_ctx->gf                   = nullptr;
