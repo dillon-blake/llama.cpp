@@ -47,6 +47,12 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // the graph is going to be differentiated, so attention must not route K/V through the
+    // KV cache: the cache write is a ggml_set_rows, whose result is a *view* of the cache
+    // buffer, which severs the autodiff edge from k_cur/v_cur to the attention output and
+    // makes ggml_build_backward_expand abort. set by llama_context::opt_init.
+    bool training;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;
