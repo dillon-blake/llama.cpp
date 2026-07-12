@@ -1766,6 +1766,37 @@ struct test_case {
         ggml_set_loss(out);
 
         ggml_build_forward_expand(gf, out);
+
+        // Skip graphs containing an inplace op.
+        //
+        // An inplace op returns a view of its source, so it overwrites the very input its
+        // backward pass would need in order to compute a gradient. ggml's autodiff says so
+        // explicitly -- ggml_build_backward_expand asserts "inplace operations are currently
+        // not supported" and hard-aborts on any node with view_src set whose op is not one of
+        // the pure-reshape ops below.
+        //
+        // Several test cases build inplace variants (test_rms_norm, test_soft_max, ...), and in
+        // MODE_GRAD they call ggml_set_param on the source, so the inplace node does need a
+        // gradient and the assert fires. That aborts the whole process, which means
+        // `test-backend-ops grad` cannot be run unfiltered at all. Detect the same condition
+        // the assert checks and skip the case, visibly, so the sweep can complete.
+        //
+        // This does not weaken the assert, and it must not: asking for the gradient of an
+        // inplace op is meaningless, not merely unsupported.
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->view_src && node->op != GGML_OP_CPY && node->op != GGML_OP_VIEW &&
+                node->op != GGML_OP_RESHAPE && node->op != GGML_OP_PERMUTE && node->op != GGML_OP_TRANSPOSE) {
+                // NOT_SUPPORTED rather than SKIPPED: console_printer only renders the former,
+                // and "not supported [inplace SOFT_MAX is not differentiable]" is exactly what
+                // this is. It matches how the existing non-F32-output skip reports itself.
+                output_printer->print_operation(test_operation_info(
+                    op_desc(out), vars(), ggml_backend_name(backend), test_status_t::NOT_SUPPORTED,
+                    std::string("inplace ") + ggml_op_name(node->op) + " is not differentiable"));
+                return true;
+            }
+        }
+
         ggml_graph_cpy(gf, gb);
         ggml_build_backward_expand(ctx.get(), gb, nullptr);
         if (expect.size() != 1 || expect[0] != 0.0f) {
