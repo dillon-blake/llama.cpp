@@ -1043,16 +1043,25 @@ static std::pair<int, int> test_dynamic_graph_grad_clip(
         print_ok(__func__, subtest_ok, npass, ntest, "clip 1: rescaled to unit norm, same direction");
     }
 
+    const std::vector<float> unclipped = run(/*clip =*/ 0.0f);
+
     {
-        const std::vector<float> w = run(/*clip =*/ 10.0f);
-        const bool subtest_ok = almost_equal(w[0], -3.0, 1e-5) && almost_equal(w[1], -4.0, 1e-5);
-        print_ok(__func__, subtest_ok, npass, ntest, "clip 10 (above the norm): gradient untouched");
+        const bool subtest_ok = almost_equal(unclipped[0], -3.0, 1e-5) && almost_equal(unclipped[1], -4.0, 1e-5);
+        print_ok(__func__, subtest_ok, npass, ntest, "clip 0: disabled");
     }
 
     {
-        const std::vector<float> w = run(/*clip =*/ 0.0f);
-        const bool subtest_ok = almost_equal(w[0], -3.0, 1e-5) && almost_equal(w[1], -4.0, 1e-5);
-        print_ok(__func__, subtest_ok, npass, ntest, "clip 0: disabled");
+        // BIT for bit, not merely close. A clip above the norm must be the identity, and the graph
+        // is built so that it is one: clamp(norm, clip, INF) returns exactly `clip` there, clip/clip
+        // is exactly 1.0, and grad * 1.0 is grad.
+        //
+        // The obvious formulation -- divide every gradient by the denominator, then scale it back
+        // by clip -- is the same number in real arithmetic and NOT the same number in float32. It
+        // perturbs the weights in the seventh decimal, which is a very quiet way for a knob that is
+        // supposed to be off to do something. This is the test that says which one was built.
+        const std::vector<float> w = run(/*clip =*/ 10.0f);
+        const bool subtest_ok = w[0] == unclipped[0] && w[1] == unclipped[1];
+        print_ok(__func__, subtest_ok, npass, ntest, "clip 10 (above the norm): identity, bit for bit");
     }
 
     (void) lr;

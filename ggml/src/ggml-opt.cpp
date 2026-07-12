@@ -68,6 +68,7 @@ struct ggml_opt_context {
     ggml_opt_get_optimizer_params get_opt_pars    = nullptr;
     void *                        get_opt_pars_ud = nullptr;
     struct ggml_tensor *          opt_step_params = nullptr; // Stores output of get_opt_pars.
+    struct ggml_tensor *          grad_clip_param = nullptr; // [1], holds grad_clip. See ggml_opt_build.
 
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
 };
@@ -370,7 +371,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         // The cpu context is allocated statically if using static graphs, dynamically otherwise.
         // It is used for:
         //   - optimizer parameters (1 shared for all optimizer invocations)
-        const size_t size_meta = 1 * ggml_tensor_overhead();
+        //   - the gradient-clipping threshold (1, likewise shared)
+        const size_t size_meta = 2 * ggml_tensor_overhead();
         struct ggml_init_params params = {
             /*.mem_size   =*/ size_meta,
             /*.mem_buffer =*/ nullptr,
@@ -505,6 +507,12 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     // gb_opt == graph backward optimize, forward pass, then backward pass to calculate gradients, then optimizer step.
     opt_ctx->gb_opt = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ true);
 
+    // A [1] tensor holding grad_clip, so the factor can be computed IN the graph as clip/denom.
+    // It lives beside opt_step_params in ctx_cpu and is filled by ggml_opt_eval.
+    opt_ctx->grad_clip_param = ggml_new_tensor_1d(opt_ctx->ctx_cpu, GGML_TYPE_F32, 1);
+    ggml_set_input(opt_ctx->grad_clip_param);
+    ggml_set_name(opt_ctx->grad_clip_param, "grad_clip");
+
     opt_ctx->opt_step_params = ggml_new_tensor_1d(opt_ctx->ctx_cpu, GGML_TYPE_F32, need_momenta ? 7 : 2);
     ggml_tensor * adamw_params = opt_ctx->opt_step_params;
     ggml_set_input(adamw_params);
@@ -529,7 +537,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     // Read it back: when norm < clip the factor is clip/clip = 1 and the gradient is untouched;
     // when norm > clip it becomes clip/norm, which rescales the global norm to exactly clip; and
     // when norm is 0 the denominator is still clip, so it yields 0 rather than a NaN.
-    struct ggml_tensor * clip_denom = nullptr;
+    struct ggml_tensor * clip_factor = nullptr;
 
     if (opt_ctx->grad_clip > 0.0f) {
         struct ggml_tensor * sumsq = nullptr;
@@ -550,8 +558,24 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             struct ggml_tensor * norm = ggml_sqrt(opt_ctx->ctx_compute, sumsq);
             ggml_set_name(norm, "grad_norm");
 
-            clip_denom = ggml_clamp(opt_ctx->ctx_compute, norm, opt_ctx->grad_clip, INFINITY);
-            ggml_set_name(clip_denom, "grad_clip_denom");
+            // denom = max(norm, clip), and the factor is clip/denom -- ONE division, of scalars,
+            // before anything touches a gradient.
+            //
+            // Doing it in that order is what makes the clip an EXACT no-op below the threshold.
+            // The obvious alternative -- divide each gradient by denom, then scale it by clip --
+            // is the same number in real arithmetic and is NOT the same number in float32: every
+            // element goes through a division and a multiplication by a large constant, and comes
+            // back rounded. A clip of 1e6 on a gradient of norm 0.02 would perturb the weights in
+            // the seventh decimal, which is a very quiet way to make a knob that is supposed to be
+            // off do something.
+            //
+            // Here, when norm <= clip, ggml_clamp returns exactly `clip` (the bound itself), and
+            // clip/clip is exactly 1.0 in IEEE-754. grad * 1.0 is grad, bit for bit.
+            struct ggml_tensor * denom = ggml_clamp(opt_ctx->ctx_compute, norm, opt_ctx->grad_clip, INFINITY);
+            ggml_set_name(denom, "grad_clip_denom");
+
+            clip_factor = ggml_div(opt_ctx->ctx_compute, opt_ctx->grad_clip_param, denom);
+            ggml_set_name(clip_factor, "grad_clip_factor");
         }
     }
 
@@ -560,11 +584,9 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         struct ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_opt, node);
 
         if (grad && (node->flags & GGML_TENSOR_FLAG_PARAM)) {
-            if (clip_denom) {
-                // The [1] denominator broadcasts across the parameter's shape.
-                grad = ggml_scale(opt_ctx->ctx_compute,
-                                  ggml_div(opt_ctx->ctx_compute, grad, clip_denom),
-                                  opt_ctx->grad_clip);
+            if (clip_factor) {
+                // The [1] factor broadcasts across the parameter's shape.
+                grad = ggml_mul(opt_ctx->ctx_compute, grad, clip_factor);
                 ggml_format_name(grad, "clipped grad for %s", node->name);
             }
 
@@ -871,6 +893,10 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     GGML_ASSERT(opt_ctx->eval_ready);
     if (opt_ctx->allocated_graph == opt_ctx->gb_opt) {
         const ggml_opt_optimizer_params & opt_pars = opt_ctx->get_opt_pars(opt_ctx->get_opt_pars_ud);
+
+        if (opt_ctx->grad_clip > 0.0f && opt_ctx->grad_clip_param) {
+            ggml_get_data_f32(opt_ctx->grad_clip_param)[0] = opt_ctx->grad_clip;
+        }
 
         switch (opt_ctx->optimizer) {
             case GGML_OPT_OPTIMIZER_TYPE_ADAMW: {
