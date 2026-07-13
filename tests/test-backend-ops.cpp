@@ -3262,7 +3262,17 @@ struct test_add_id : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, n_embd, n_experts_used, n_token);
+        ggml_set_name(a, "a");
+        // learning-llamas (S1-25): ADD_ID's src0 VJP is the identity. Ask for it -- without a
+        // ggml_set_param the MODE_GRAD case builds no backward at all and reports OK regardless.
+        // src1 is the bias TABLE (a frozen base weight; per-expert bias grads are ROADMAP E8) and
+        // ids is I32, so neither is a param here.
+        if (type_a == GGML_TYPE_F32) {
+            ggml_set_param(a);
+        }
+
         ggml_tensor * b = ggml_new_tensor_2d(ctx, type_b, n_embd, n_experts);
+        ggml_set_name(b, "b");
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_experts, n_token);
         if (n_experts_used != n_experts) {
             ids = ggml_view_2d(ctx, ids, n_experts_used, n_token, ids->nb[1], 0);
@@ -4338,6 +4348,21 @@ struct test_mul_mat_id : public test_case {
         ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
         ggml_set_name(as, "as");
 
+        // learning-llamas (S1-25): ask for BOTH gradients.
+        //
+        // `as` is not an exotic param. build_lora_mm_id computes
+        // mul_mat_id(B, mul_mat_id(A, cur, ids), ids), so the trainable LoRA A/B tensors ARE the
+        // 3D expert operand -- LoRA-only MoE training needs the weight-grad half, and an
+        // "activations only" backward would silently train nothing at all.
+        //
+        // These cases build a backward graph containing OUT_PROD_ID / OUT_PROD_ID_GRP, which no
+        // backend supports yet (the kernels are S1-26 / S1-27). They therefore register and report
+        // not-supported rather than executing -- which is the point: the wiring is exercised now,
+        // and the day a kernel lands these turn on with no test change.
+        if (type_a == GGML_TYPE_F32) {
+            ggml_set_param(as);
+        }
+
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
         ggml_set_name(ids, "ids");
         if (n_used != n_mats) {
@@ -4347,6 +4372,9 @@ struct test_mul_mat_id : public test_case {
 
         ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
         ggml_set_name(b, "b");
+        if (type_b == GGML_TYPE_F32) {
+            ggml_set_param(b);
+        }
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_set_name(out, "out");

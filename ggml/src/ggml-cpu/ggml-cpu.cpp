@@ -467,6 +467,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                     ((ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
                      src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_OUT_PROD_ID:
+        case GGML_OP_OUT_PROD_ID_GRP:
+            // learning-llamas (S1-25): declared, not yet implemented. The kernels land in S1-26 and
+            // S1-27, which flip this to a real check.
+            //
+            // This case is NOT redundant, and leaving it out is the trap. The default below returns
+            // TRUE -- so a brand-new op with no dispatch case is reported *supported* by the CPU
+            // backend, gets scheduled, and then hits ggml_compute_forward's `default: GGML_ABORT`.
+            // The op would look implemented right up until it killed the process.
+            return false;
         default:
             return true;
     }
