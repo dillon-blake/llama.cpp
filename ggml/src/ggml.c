@@ -6641,6 +6641,38 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_repeat_back(ctx, grad, src0));
             }
         } break;
+        case GGML_OP_CONCAT: {
+            // A concat copies each source into its own slab of the output, so the gradient is just
+            // the matching slab of the output's gradient handed back. src0 sits at offset 0 along
+            // the concat dim; src1 starts where src0 ends.
+            //
+            // The views are ggml_cont'd because the slabs are STRIDED in the output -- taking every
+            // row's first half is not contiguous memory, and a tensor that is accumulated into must
+            // be. (The mamba conv-state concat only ever needs the src1 side, but both are handled:
+            // guarding one and not the other is how you get a gradient that is right on the shapes
+            // you tested and silently zero on the ones you did not.)
+            const int32_t dim = ggml_get_op_params_i32(tensor, 0);
+
+            GGML_ASSERT(dim >= 0 && dim < GGML_MAX_DIMS);
+
+            if (src0_needs_grads) {
+                struct ggml_tensor * view = ggml_view_4d(ctx, grad,
+                        src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                        grad->nb[1], grad->nb[2], grad->nb[3], 0);
+
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, view));
+            }
+
+            if (src1_needs_grads) {
+                const size_t offset = src0->ne[dim]*grad->nb[dim];
+
+                struct ggml_tensor * view = ggml_view_4d(ctx, grad,
+                        src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                        grad->nb[1], grad->nb[2], grad->nb[3], offset);
+
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, view));
+            }
+        } break;
         case GGML_OP_REPEAT_BACK: {
             if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_repeat(ctx, grad, src0));
