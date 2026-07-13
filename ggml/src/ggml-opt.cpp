@@ -59,6 +59,13 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
 
+    // Gradient checkpointing (empty = off). The forward tensors that survive the forward pass;
+    // everything else between them is recomputed in the backward. Set between
+    // ggml_opt_prepare_alloc and ggml_opt_alloc, because it is a property of the graph about to
+    // be built -- and re-set on every step, since a dynamic graph is rebuilt every step and these
+    // are pointers into it.
+    std::vector<struct ggml_tensor *> checkpoints;
+
     int64_t iter               = 1;
     int32_t opt_period         = 1;
     float   grad_clip          = 0.0f;
@@ -490,8 +497,19 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     }
 
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
-    opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
-    ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    if (opt_ctx->checkpoints.empty()) {
+        opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
+        ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    } else {
+        // Room for the forward, the backward, AND the recompute nodes -- the last of which is
+        // another forward's worth. ggml_graph_dup would have sized it for one graph.
+        opt_ctx->gb_grad = ggml_new_graph_custom(
+            opt_ctx->ctx_compute, 2*opt_ctx->gf->size, /*grads =*/ true);
+
+        ggml_build_backward_expand_checkpointed(
+            opt_ctx->ctx_compute, opt_ctx->gf, opt_ctx->gb_grad, opt_ctx->grad_accs.data(),
+            opt_ctx->checkpoints.data(), (int) opt_ctx->checkpoints.size());
+    }
 
     if (opt_ctx->buf_static) {
         if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_GRAD) {
@@ -834,6 +852,26 @@ void ggml_opt_prepare_alloc(
     opt_ctx->gf          = gf;
     opt_ctx->inputs      = inputs;
     opt_ctx->outputs     = outputs;
+
+    // Last step's checkpoints pointed into last step's graph, which no longer exists. Dropping them
+    // here means a caller who stops asking for checkpointing gets checkpointing off -- rather than
+    // a handful of dangling pointers into a freed compute context.
+    opt_ctx->checkpoints.clear();
+}
+
+void ggml_opt_set_checkpoints(
+        ggml_opt_context_t    opt_ctx,
+        struct ggml_tensor ** checkpoints,
+        int                   n_checkpoints) {
+    GGML_ASSERT(opt_ctx->gf && "call ggml_opt_prepare_alloc first: checkpoints are nodes of ITS graph");
+    GGML_ASSERT(!opt_ctx->eval_ready);
+
+    opt_ctx->checkpoints.clear();
+    if (!checkpoints || n_checkpoints <= 0) {
+        return;
+    }
+
+    opt_ctx->checkpoints.assign(checkpoints, checkpoints + n_checkpoints);
 }
 
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
