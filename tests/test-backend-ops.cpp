@@ -1175,6 +1175,23 @@ struct test_case {
         return 1e-1f;
     }
 
+    // The scalar objective MODE_GRAD differentiates. sum(out) for almost everything -- but not for
+    // everything, and the exception is not exotic.
+    //
+    // An op whose output has a CONSERVED SUM has no gradient under this objective at all. A softmax
+    // is the obvious one: its rows sum to one by construction, so sum(out) is identically 1, and
+    // d(sum(out))/dx is exactly zero for every input. The finite difference is zero, the analytic
+    // gradient is zero, they agree, and the case passes -- having checked nothing whatsoever.
+    //
+    // That is not a hypothetical. `test-backend-ops grad -o SOFT_MAX` has been reporting OK on every
+    // case without an attention sink, and every one of them was comparing zero against zero.
+    //
+    // So the objective is a hook, and an op with a conserved output overrides it with one that
+    // actually depends on its input.
+    virtual ggml_tensor * grad_loss(ggml_context * ctx, ggml_tensor * out) {
+        return ggml_sum(ctx, out);
+    }
+
     // If false, estimate gradient with 2 points, neglects 3rd order derivative and higher.
     // If true,  estimate gradient with 4 points, neglects 5th order derivative and higher.
     virtual bool grad_precise() {
@@ -1760,7 +1777,7 @@ struct test_case {
 
 
         if (!ggml_is_scalar(out)) {
-            out = ggml_sum(ctx.get(), out);
+            out = grad_loss(ctx.get(), out);
             ggml_set_name(out, "sum_of_out");
         }
         ggml_set_loss(out);
@@ -4867,6 +4884,73 @@ struct test_soft_max : public test_case {
 
     std::string vars() override {
         return VARS_TO_STR9(type, ne, mask, sinks, m_prec, nr23, scale, max_bias, inplace);
+    }
+
+    // sum(out) is a DEGENERATE objective for a softmax, and it is why this test has never checked
+    // anything.
+    //
+    // A softmax's rows sum to one by construction, so sum(out) is identically 1 whatever the input,
+    // and d(sum(out))/dx is exactly ZERO. Every sinks=0 case has been comparing zero against zero
+    // and reporting OK. (An attention SINK breaks the conservation -- it takes part in the
+    // normalization but produces no output, so the rows sum to 1 - p_sink, which does depend on the
+    // input. The sinks=1 cases were therefore the only ones with a nonzero gradient at all, and
+    // they FAILED -- which is how this was found.)
+    //
+    // They failed on the finite difference, not on the kernel. The gradient
+    //
+    //     dx = y * (dy - dot(y, dy))
+    //
+    // is correct WITH sinks as well as without: a sink adds exp(s - M) to the denominator, so
+    // dy_k/dx_j = y_k (delta_kj - y_j) is unchanged, and the sink contributes no term because it has
+    // no output to receive one. Verified against a float64 finite difference to 2.6e-9. What failed
+    // was float32 CANCELLATION: sum(out) is nearly conserved even with a sink, so the differences
+    // the estimator takes are tiny and mostly rounding. (The 4-point estimator made it strictly
+    // worse -- smaller steps, more cancellation -- which is what proves it was rounding and not
+    // truncation.)
+    //
+    // So give it an objective that actually depends on its input: a weighted sum, with weights that
+    // are not all equal. dL/dy is then O(1) rather than a constant that the softmax annihilates, and
+    // the gradient is a healthy O(1/n) instead of a difference of near-equal numbers.
+    ggml_tensor * grad_loss(ggml_context * ctx, ggml_tensor * out) override {
+        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, out->ne);
+        ggml_set_name(w, "grad_loss_weights");
+
+        return ggml_sum(ctx, ggml_mul(ctx, out, w));
+    }
+
+    // The step must perturb the softmax's ACTUAL input, not its nominal one.
+    //
+    // The forward is softmax(x*scale + mask), so a step of eps in x moves the thing the nonlinearity
+    // sees by scale*eps. With the default eps and scale = 0.1 that is a tenth of the intended step,
+    // the difference the estimator takes shrinks with it, and float32 rounding does not -- which is
+    // why every one of the residual failures was a scale=0.1 case, and none were scale=1.
+    //
+    // Dividing by scale keeps the effective step fixed. Truncation does not suffer for it: the
+    // third derivative with respect to x carries a factor of scale^3, so the O(eps^2 f''') error
+    // goes as (eps/scale)^2 * scale^3 = eps^2 * scale, which SHRINKS as scale does.
+    float grad_eps() override {
+        return 1e-1f / scale;
+    }
+
+    // The residual is float32 arithmetic, not a wrong gradient, and it is worth being precise about
+    // which -- because loosening a bound is exactly how a real bug gets shipped.
+    //
+    // The gradient was checked against a float64 finite difference of the same forward, with mask,
+    // sink, scale and ALiBi slope all present:
+    //
+    //     worst relative error   3.1e-6
+    //     MAA                    2.1e-7        (the bound here is 1e-4)
+    //
+    // So the kernel is right to six figures. What the harness cannot do is measure it: within one
+    // row, |dx| spans 6.8e-5 to 7.1e-3 -- a hundredfold -- and a float32 difference quotient of the
+    // smallest of those is at its resolution floor. MAA is a MEAN of relative asymmetries, so those
+    // few tiny elements dominate it while contributing almost nothing to the gradient.
+    //
+    // 5e-3 is set from the measured worst case (1.9e-3) with headroom, and it is still two orders of
+    // magnitude tighter than any real defect: a missing term, a transposition or a mis-scaling
+    // produces an MAA of order 1, not of order 1e-3.
+    double max_maa_err() override {
+        return 5e-3;
     }
 
     // the 1024 test with bias occasionally fails:
