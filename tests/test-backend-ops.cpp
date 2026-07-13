@@ -4313,9 +4313,12 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    // learning-llamas: bit 1 = ask for d(as) [OUT_PROD_ID_GRP], bit 2 = ask for d(b) [OUT_PROD_ID].
+    // 0 keeps the case eval-only, which is what every pre-existing instantiation wants.
+    const int grad_param;
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, grad_param);
     }
 
     double max_nmse_err() override {
@@ -4337,29 +4340,51 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, int grad_param = 0)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), grad_param(grad_param) {
             GGML_ASSERT(n_used <= n_mats);
         }
+
+    // MODE_GRAD's default objective is sum(out), and under it THIS OP'S WEIGHT GRADIENT IS
+    // VACUOUS. With an all-ones incoming gradient,
+    //
+    //     d_as[i,j,e] = sum_{(s,t): ids=e} b[i,s'] * 1
+    //
+    // is independent of j -- the result is constant along the entire output axis, so a kernel that
+    // ignored `grad` completely and just summed b-columns per expert would pass every case. A
+    // weighted sum makes the objective depend on grad's actual (j, slot, token) structure, which is
+    // the only thing that can catch a transposed or mis-strided read of it.
+    //
+    // Same trap, same fix as SOFT_MAX (S1-34): an op can be invisible to sum(out) for structural
+    // reasons, and then its grad test checks nothing while reporting OK.
+    ggml_tensor * grad_loss(ggml_context * ctx, ggml_tensor * out) override {
+        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, out->ne);
+        ggml_set_name(w, "grad_loss_weights");
+
+        return ggml_sum(ctx, ggml_mul(ctx, out, w));
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
         ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
         ggml_set_name(as, "as");
 
-        // learning-llamas (S1-25): ask for BOTH gradients.
+        // learning-llamas (S1-25/S1-27): WHICH gradients are asked for is a test parameter, and it
+        // has to be, because the two halves of MUL_MAT_ID's backward are separate ops landing in
+        // separate tickets:
         //
-        // `as` is not an exotic param. build_lora_mm_id computes
+        //   grad_param & 1  ->  as needs grads  ->  emits OUT_PROD_ID_GRP  (S1-27, implemented)
+        //   grad_param & 2  ->  b  needs grads  ->  emits OUT_PROD_ID      (S1-26, still pending)
+        //
+        // An `as`-only case therefore exercises S1-27's kernel ALONE. Asking for both would make
+        // every case depend on the op that does not exist yet, and S1-27 would have no green test
+        // to stand on.
+        //
+        // `as` is not an exotic param: build_lora_mm_id computes
         // mul_mat_id(B, mul_mat_id(A, cur, ids), ids), so the trainable LoRA A/B tensors ARE the
-        // 3D expert operand -- LoRA-only MoE training needs the weight-grad half, and an
-        // "activations only" backward would silently train nothing at all.
-        //
-        // These cases build a backward graph containing OUT_PROD_ID / OUT_PROD_ID_GRP, which no
-        // backend supports yet (the kernels are S1-26 / S1-27). They therefore register and report
-        // not-supported rather than executing -- which is the point: the wiring is exercised now,
-        // and the day a kernel lands these turn on with no test change.
-        if (type_a == GGML_TYPE_F32) {
+        // 3D expert operand. LoRA-only MoE training needs the weight-grad half.
+        if ((grad_param & 1) && type_a == GGML_TYPE_F32) {
             ggml_set_param(as);
         }
 
@@ -4372,7 +4397,7 @@ struct test_mul_mat_id : public test_case {
 
         ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
         ggml_set_name(b, "b");
-        if (type_b == GGML_TYPE_F32) {
+        if ((grad_param & 2) && type_b == GGML_TYPE_F32) {
             ggml_set_param(b);
         }
 
@@ -9152,6 +9177,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nr2 : {8, 16, 32}) {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
                                                   256, 16, 16, {1, 1}, {nr2, 1}));
+    }
+
+    // learning-llamas (S1-25/S1-27): MUL_MAT_ID gradient cases.
+    //
+    // Deliberately TINY. grad_nmax() is 10000 parameter elements, and every pre-existing
+    // test_mul_mat_id shape is far above it -- so they would be SILENTLY SKIPPED under MODE_GRAD
+    // and print OK. (That is trap #2 of ADR-0002, and it is why these shapes are 4x6x8 rather than
+    // anything realistic: 4*6*3 = 72 elements for `as`.)
+    //
+    // grad_param 1 = d(as) only -> exercises OUT_PROD_ID_GRP alone (S1-27, implemented).
+    // grad_param 2 = d(b)  only -> exercises OUT_PROD_ID alone      (S1-26, still pending, so these
+    //                              register and report not-supported rather than aborting).
+    // grad_param 3 = both.
+    //
+    // `b` toggles the forward's BROADCAST: false gives ne_b1 == n_used, true gives ne_b1 == 1.
+    // Both are live in the real LoRA MoE graph -- the inner mul_mat_id broadcasts, the outer does
+    // not -- and they are different index arithmetic in the kernel, so both are covered.
+    for (int grad_param : {1, 2, 3}) {
+        for (bool bcast : {false, true}) {
+            for (int n_used : {1, 2}) {
+                test_cases.emplace_back(new test_mul_mat_id(
+                    GGML_TYPE_F32, GGML_TYPE_F32, /*n_mats =*/ 3, n_used, bcast,
+                    /*m =*/ 6, /*n =*/ 5, /*k =*/ 4, grad_param));
+            }
+        }
     }
 
     // add_id

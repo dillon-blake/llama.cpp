@@ -467,10 +467,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                     ((ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
                      src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
-        case GGML_OP_OUT_PROD_ID:
         case GGML_OP_OUT_PROD_ID_GRP:
-            // learning-llamas (S1-25): declared, not yet implemented. The kernels land in S1-26 and
-            // S1-27, which flip this to a real check.
+            // learning-llamas (S1-27): d(as). All three operands are F32 on the training path --
+            // b is activations, grad is a gradient, and the expert stack it feeds is the F32 LoRA
+            // A/B (base experts are frozen). A quantized `as` would need a dequantizing variant,
+            // and there is no caller for one.
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_OUT_PROD_ID:
+            // learning-llamas (S1-25): declared, not yet implemented. The kernel lands in S1-26,
+            // which flips this to a real check.
             //
             // This case is NOT redundant, and leaving it out is the trap. The default below returns
             // TRUE -- so a brand-new op with no dispatch case is reported *supported* by the CPU
