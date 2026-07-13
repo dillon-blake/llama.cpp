@@ -5688,6 +5688,23 @@ struct test_concat : public test_case {
             int dim = 2, int v = 0)
         : type(type), ne_a(ne_a), ne_b_d(ne_b_d), dim(dim), v(v) {}
 
+    // sum(out) cannot see a concat bug, and that is not a subtlety -- it is the whole test.
+    //
+    // With the default objective, dL/d(out) is 1 everywhere. A concat's gradient is "hand each
+    // source back its own slab of dL/d(out)", so both slabs are all-ones -- and they are all-ones
+    // whichever slab you hand back. Swap the offsets, hand src1 src0's slab, hand both of them the
+    // same slab: the gradient is identical, and the test reports OK. Verified: with sum(out), the
+    // backward rule's src1 offset can be set to 0 and Backend CPU still says OK.
+    //
+    // A weighted sum, whose weights are not all equal, makes each element of dL/d(out) distinct --
+    // so a source that is handed the wrong slab is handed visibly wrong numbers.
+    ggml_tensor * grad_loss(ggml_context * ctx, ggml_tensor * out) override {
+        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, out->ne);
+        ggml_set_name(w, "grad_loss_weights");
+
+        return ggml_sum(ctx, ggml_mul(ctx, out, w));
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         auto ne_b = ne_a;
         ne_b[dim] = ne_b_d;
@@ -5702,6 +5719,17 @@ struct test_concat : public test_case {
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
             ggml_set_name(a, "a");
+
+            // Without this, MODE_GRAD checks nothing at all -- eval_grad only compares gradients
+            // for tensors that were flagged as parameters, and this test flagged none. It printed
+            // "not supported [CONCAT]" and the run still ended in Backend CPU: OK. (S0-10 measured
+            // that 52 of the 100 test_case classes are in the same state.)
+            //
+            // Only the non-view variants are flagged: a gradient with respect to a VIEW is not
+            // something ggml's autodiff computes, and asking for one aborts.
+            if (type == GGML_TYPE_F32) {
+                ggml_set_param(a);
+            }
         }
         ggml_tensor * b;
         if (v & 2) {
@@ -5714,6 +5742,14 @@ struct test_concat : public test_case {
         } else {
             b = ggml_new_tensor(ctx, type, 4, ne_b.data());
             ggml_set_name(b, "b");
+
+            // BOTH sides, and that is not belt-and-braces. src0's gradient is the slab at offset 0
+            // and src1's is the slab after it -- so a test that only flags `a` never checks the
+            // OFFSET at all. Verified: with only `a` flagged, deliberately breaking src1's offset
+            // to 0 still reports Backend CPU: OK.
+            if (type == GGML_TYPE_F32) {
+                ggml_set_param(b);
+            }
         }
 
         ggml_tensor * out = ggml_concat(ctx, a, b, dim);
@@ -9296,6 +9332,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int v : { 0, 1, 2, 3 }) {
         for (int dim : { 0, 1, 2, 3, }) {
             test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {11, 12, 13, 14}, 7, dim, v));
+
+            // A SMALL f32 case per dim, purely so MODE_GRAD can actually run.
+            //
+            // The shapes above are 11*12*13*14 = 24024 elements, and grad_nmax() is 10000 -- so
+            // every one of them is SKIPPED ("skipping large tensors for speed") and the gradient is
+            // never checked. The case still prints OK. That is the third distinct way a MODE_GRAD
+            // case can be green while checking nothing, after "never calls ggml_set_param" (S0-10)
+            // and "the objective conserves the output's sum" (S1-34).
+            //
+            // 2*3*2*2 = 24 elements: a full finite-difference sweep costs 48 forward passes.
+            test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {2, 3, 2, 2}, 1, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {11, 12, 13, 14}, 7, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_BF16, {11, 12, 13, 14}, 7, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_I8, {11, 12, 13, 14}, 7, dim, v));
