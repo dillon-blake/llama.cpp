@@ -4512,6 +4512,101 @@ void ggml_compute_forward_out_prod(
     }
 }
 
+// ggml_compute_forward_out_prod_id_grp  (learning-llamas, S1-27)
+//
+// The WEIGHT half of MUL_MAT_ID's backward: d(as).
+//
+//   forward   dst[j,i,t] = sum_k as[k,j, ids[i,t]] * b[k, i % ne_b1, t]
+//   this op   d_as[k,j,e] = sum_{(i,t) : ids[i,t] == e}  b[k, i % ne_b1, t] * grad[j,i,t]
+//
+//   src0 = b     [n,  ne_b1, n_tok]   activations
+//   src1 = grad  [m,  n_ids, n_tok]   incoming gradient
+//   src2 = ids   [n_ids, n_tok]  I32  which expert each (slot, token) routed to
+//   dst          [n,  m,     n_expert]
+//
+// "grp" is for GROUPED: it reduces over every (slot, token) that routed to a given expert. That
+// reduction is the whole difficulty. An expert chosen by many tokens accumulates all of them, and
+// a token may route to several experts -- so this is a scatter-add, not a permutation.
+//
+// It is threaded BY EXPERT, and that is deliberate rather than incidental: each expert's output
+// slice is written by exactly one thread, so the accumulation needs no atomics and no reduction
+// barrier, and the summation order within a slice is fixed by the (t, i) loop rather than by which
+// thread got there first. Determinism is a hard requirement on a gradient path (ADR-0002) -- a
+// float sum whose order depends on thread scheduling makes a training run unreproducible, and it
+// does so silently.
+//
+// Experts with no tokens routed to them are not skipped: their slice is still zeroed, because it
+// is a gradient and the optimizer will read it whether or not anything routed there this step.
+static void ggml_compute_forward_out_prod_id_grp_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];  // b
+    const ggml_tensor * src1 = dst->src[1];  // grad
+    const ggml_tensor * src2 = dst->src[2];  // ids
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n        = src0->ne[0];  // b's row length  == dst->ne[0]
+    const int64_t ne_b1    = src0->ne[1];  // b's broadcast dim
+    const int64_t n_tok    = src0->ne[2];
+    const int64_t m        = src1->ne[0];  // grad's row length == dst->ne[1]
+    const int64_t n_ids    = src1->ne[1];
+    const int64_t n_expert = dst->ne[2];
+
+    GGML_ASSERT(dst->ne[0] == n);
+    GGML_ASSERT(dst->ne[1] == m);
+    GGML_ASSERT(src1->ne[2] == n_tok);
+    GGML_ASSERT(src2->ne[0] == n_ids);
+    GGML_ASSERT(src2->ne[1] == n_tok);
+    GGML_ASSERT(n_ids % ne_b1 == 0);
+
+    for (int64_t e = ith; e < n_expert; e += nth) {
+        float * d_e = (float *) ((char *) dst->data + e*dst->nb[2]);
+
+        // Zero this expert's whole slice first -- including the experts nothing routes to.
+        for (int64_t j = 0; j < m; ++j) {
+            ggml_vec_set_f32(n, (float *) ((char *) d_e + j*dst->nb[1]), 0.0f);
+        }
+
+        for (int64_t t = 0; t < n_tok; ++t) {
+            const int32_t * ids_t = (const int32_t *) ((const char *) src2->data + t*src2->nb[1]);
+
+            for (int64_t i = 0; i < n_ids; ++i) {
+                if (ids_t[i] != (int32_t) e) {
+                    continue;
+                }
+
+                // The forward broadcasts b's columns across slots when ne_b1 < n_ids, so slot i
+                // reads column i % ne_b1 -- and the gradient must gather from the same column.
+                const float * b_col = (const float *) ((const char *) src0->data
+                                        + (i % ne_b1)*src0->nb[1] + t*src0->nb[2]);
+                const float * g_col = (const float *) ((const char *) src1->data
+                                        + i*src1->nb[1] + t*src1->nb[2]);
+
+                // d_as[:, j, e] += g_col[j] * b_col[:]
+                for (int64_t j = 0; j < m; ++j) {
+                    ggml_vec_mad_f32(n, (float *) ((char *) d_e + j*dst->nb[1]), b_col, g_col[j]);
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_out_prod_id_grp(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    ggml_compute_forward_out_prod_id_grp_f32(params, dst);
+}
+
 // ggml_compute_forward_scale
 
 static void ggml_compute_forward_scale_f32(
