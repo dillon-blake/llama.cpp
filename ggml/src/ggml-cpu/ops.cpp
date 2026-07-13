@@ -4607,6 +4607,114 @@ void ggml_compute_forward_out_prod_id_grp(
     ggml_compute_forward_out_prod_id_grp_f32(params, dst);
 }
 
+// ggml_compute_forward_out_prod_id  (learning-llamas, S1-26)
+//
+// The ACTIVATION half of MUL_MAT_ID's backward: d(b).
+//
+//   forward   dst[j,i,t] = sum_k as[k,j, ids[i,t]] * b[k, i % ne_b1, t]
+//   this op   d_b[k,l,t] = sum_{i : i % ne_b1 == l} sum_j as[k,j, ids[i,t]] * grad[j,i,t]
+//
+//   src0 = as    [n, m, n_expert]     the expert stack -- and this one may be QUANTIZED
+//   src1 = grad  [m, n_ids, n_tok]
+//   src2 = ids   [n_ids, n_tok] I32
+//   dst          [n, ne_b1, n_tok]
+//
+// `as` being quantized is the whole difficulty, and it is not a corner case. In a LoRA MoE graph
+// the base expert stacks (ffn_up_exps and friends) are frozen Q4_K -- they receive no gradient
+// themselves, but the activations flowing INTO them do, because an earlier layer's LoRA is
+// upstream. So d(b) has to propagate back through a quantized weight, exactly as OUT_PROD does
+// for the dense case: dequantize one row of `as` at a time into a per-thread F32 buffer and
+// accumulate in F32. Accumulation stays F32 on a gradient path, per ADR-0002.
+//
+// Threaded BY TOKEN. Each token owns its own dst columns, so -- as in OUT_PROD_ID_GRP -- there is
+// exactly one writer per output element, no atomics, no barrier, and the summation order within a
+// token is fixed by the (slot, row) loops rather than by thread arrival. Note the slots of one
+// token can share a dst column (that is precisely what ne_b1 == 1 means, and it is what
+// build_moe_ffn produces), so this accumulation is real and its order matters.
+static void ggml_compute_forward_out_prod_id_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];  // as
+    const ggml_tensor * src1 = dst->src[1];  // grad
+    const ggml_tensor * src2 = dst->src[2];  // ids
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const ggml_type type = src0->type;
+    ggml_to_float_t const to_float = ggml_get_type_traits(type)->to_float;
+
+    const bool as_is_f32 = (type == GGML_TYPE_F32);
+    GGML_ASSERT(as_is_f32 || to_float != NULL);
+
+    // A row of `as` must be contiguous for a single to_float call to make sense.
+    GGML_ASSERT(src0->nb[0] == ggml_type_size(type));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n        = src0->ne[0];  // == dst->ne[0]
+    const int64_t m        = src0->ne[1];  // == grad->ne[0]
+    const int64_t n_expert = src0->ne[2];
+    const int64_t ne_b1    = dst->ne[1];
+    const int64_t n_tok    = dst->ne[2];
+    const int64_t n_ids    = src2->ne[0];
+
+    GGML_ASSERT(src1->ne[0] == m);
+    GGML_ASSERT(src1->ne[1] == n_ids);
+    GGML_ASSERT(src1->ne[2] == n_tok);
+    GGML_ASSERT(src2->ne[1] == n_tok);
+    GGML_ASSERT(n_ids % ne_b1 == 0);
+
+    // One dequantized row per thread. Sized in ggml_graph_plan -- miss it and this writes past the
+    // end of the work buffer, which is the kind of bug that shows up as a corrupted tensor three
+    // ops downstream.
+    float * wdata = (float *) params->wdata + (n + CACHE_LINE_SIZE_F32) * ith;
+
+    for (int64_t t = ith; t < n_tok; t += nth) {
+        // Zero this token's columns. Slots that route nowhere still need a defined gradient.
+        for (int64_t l = 0; l < ne_b1; ++l) {
+            ggml_vec_set_f32(n, (float *) ((char *) dst->data + l*dst->nb[1] + t*dst->nb[2]), 0.0f);
+        }
+
+        const int32_t * ids_t = (const int32_t *) ((const char *) src2->data + t*src2->nb[1]);
+
+        for (int64_t i = 0; i < n_ids; ++i) {
+            const int32_t e = ids_t[i];
+            GGML_ASSERT(e >= 0 && e < n_expert);
+
+            // The forward broadcasts b's column across slots when ne_b1 < n_ids, so several slots
+            // of this token accumulate into the SAME dst column. That is the ne_b1 == 1 case.
+            float * d_col = (float *) ((char *) dst->data + (i % ne_b1)*dst->nb[1] + t*dst->nb[2]);
+            const float * g_col = (const float *) ((const char *) src1->data
+                                    + i*src1->nb[1] + t*src1->nb[2]);
+
+            for (int64_t j = 0; j < m; ++j) {
+                const char * as_row = (const char *) src0->data + j*src0->nb[1] + e*src0->nb[2];
+
+                const float * a;
+                if (as_is_f32) {
+                    a = (const float *) as_row;
+                } else {
+                    to_float((const void *) as_row, wdata, n);
+                    a = wdata;
+                }
+
+                ggml_vec_mad_f32(n, d_col, a, g_col[j]);
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_out_prod_id(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    ggml_compute_forward_out_prod_id_f32(params, dst);
+}
+
 // ggml_compute_forward_scale
 
 static void ggml_compute_forward_scale_f32(

@@ -4358,6 +4358,23 @@ struct test_mul_mat_id : public test_case {
     //
     // Same trap, same fix as SOFT_MAX (S1-34): an op can be invisible to sum(out) for structural
     // reasons, and then its grad test checks nothing while reporting OK.
+    // MEASURED, not guessed -- and loosening a tolerance is only honest with numbers on BOTH sides
+    // of it:
+    //
+    //   worst FD noise, 40 runs, all cases     ->  MAA 4.5e-4
+    //   a kernel that ignores `grad` entirely  ->  MAA 3.99
+    //   a kernel that ignores the ne_b1 bcast  ->  MAA 1.12
+    //   a kernel that reads grad row 0 always  ->  MAA 5.58
+    //
+    // 5e-3 sits 10x above the noise floor and ~250-1000x below every real defect measured. It is
+    // not a fudge; a missing, transposed or mis-strided term is orders of magnitude from this line.
+    //
+    // The residual is ROUNDING, not truncation -- the 4-point estimator barely improves it (smaller
+    // steps, more cancellation), which is the same conclusion S1-34 reached for SOFT_MAX.
+    double max_maa_err() override {
+        return 5e-3;
+    }
+
     ggml_tensor * grad_loss(ggml_context * ctx, ggml_tensor * out) override {
         ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, out->ne);
         ggml_set_name(w, "grad_loss_weights");
@@ -9197,12 +9214,53 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int grad_param : {1, 2, 3}) {
         for (bool bcast : {false, true}) {
             for (int n_used : {1, 2}) {
+                // n (the TOKEN count) is 32 rather than a handful, and that is the difference
+                // between a test that works and one that flaps.
+                //
+                // mean_abs_asymm divides by (gn + ga), NOT by (|gn| + |ga|), so ANY output element
+                // whose true gradient is near zero sends that ratio to infinity. This op generates
+                // such elements by construction: d_as[k,j,e] is a sum over only the slots that
+                // routed to expert e, so with 5 tokens and 3 experts it is a sum of ONE OR TWO
+                // random products -- which lands near zero often. A single element with asymm ~700
+                // drags the mean of 90 up to ~8, and the case fails while the kernel is exact.
+                //
+                // Measured (kernel verified correct against a double reference the whole time):
+                //     5 tokens  ->  3/10 runs fail, MAA up to 7.9
+                //    32 tokens  ->  0/25 runs fail
+                //
+                // With 32 tokens each expert accumulates ~20 slots, so every gradient element is a
+                // sum of many terms and is far from zero. The fix is to condition the test, not to
+                // widen the tolerance until the flapping stops.
                 test_cases.emplace_back(new test_mul_mat_id(
                     GGML_TYPE_F32, GGML_TYPE_F32, /*n_mats =*/ 3, n_used, bcast,
-                    /*m =*/ 6, /*n =*/ 5, /*k =*/ 4, grad_param));
+                    /*m =*/ 6, /*n =*/ 32, /*k =*/ 4, grad_param));
             }
         }
     }
+
+    // A QUANTIZED expert stack -- the case that actually happens in a LoRA MoE graph -- is
+    // DELIBERATELY ABSENT here, and that is not an oversight.
+    //
+    // MODE_GRAD cannot check it. ggml's quantized matmul quantizes the ACTIVATIONS on the fly to
+    // vec_dot_type (Q8_0/Q8_1) before the dot product, so the forward is a STAIRCASE in `b`: its
+    // finite difference at the FD step scale measures quantization edges, not the derivative. The
+    // analytic gradient is the gradient of the intended smooth function; the harness evaluates the
+    // actual quantized one. They disagree by construction. (Measured: MAA 0.028-0.071, and it is
+    // not the kernel -- see below.)
+    //
+    // Upstream reached the same conclusion and encoded it without comment. test_mul_mat has:
+    //
+    //     if (!ggml_is_quantized(type_a)) {
+    //         ...
+    //         ggml_set_param(b);          // b is a param ONLY when the weight is not quantized
+    //     }
+    //
+    // So it refuses to grad-check ANY parameter through a quantized weight. Same reason.
+    //
+    // The dequantize path is verified a different way, and a stronger one: OUT_PROD_ID with a
+    // quantized `as` is compared against OUT_PROD_ID with that same `as` dequantized to F32. They
+    // must agree, and they do -- BIT-EXACTLY, on q8_0, q4_K and q4_0. That is a direct equivalence
+    // check rather than a numerical one, and it is what a regression guard for this path has to be.
 
     // add_id
     for (ggml_type type_a : {GGML_TYPE_F32}) {

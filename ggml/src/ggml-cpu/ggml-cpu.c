@@ -1849,6 +1849,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_out_prod_id_grp(params, tensor);
             } break;
+        case GGML_OP_OUT_PROD_ID:
+            {
+                ggml_compute_forward_out_prod_id(params, tensor);
+            } break;
         case GGML_OP_SCALE:
             {
                 ggml_compute_forward_scale(params, tensor);
@@ -2326,6 +2330,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
         case GGML_OP_OUT_PROD_ID_GRP:
+        case GGML_OP_OUT_PROD_ID:
             {
                 n_tasks = n_threads;
             } break;
@@ -2879,6 +2884,19 @@ struct ggml_cplan ggml_graph_plan(
                             node->src[0]->type == GGML_TYPE_BF16) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
+                    } break;
+                case GGML_OP_OUT_PROD_ID:
+                    {
+                        // learning-llamas (S1-26): d(b) propagates back through the base expert
+                        // stack, which in a LoRA MoE graph is frozen and QUANTIZED. The kernel
+                        // dequantizes one row of `as` at a time into a per-thread F32 buffer.
+                        //
+                        // Sized unconditionally, not just for quantized `as`. The buffer costs one
+                        // row per thread, and making it conditional means a later change to the
+                        // kernel's fast path silently overruns the work buffer -- which surfaces as
+                        // a corrupted tensor several ops downstream, not as a crash here.
+                        cur = ggml_type_size(GGML_TYPE_F32) *
+                              (node->src[0]->ne[0] + CACHE_LINE_SIZE/sizeof(float)) * n_tasks;
                     } break;
                 case GGML_OP_SOFT_MAX:
                 case GGML_OP_ROPE:
