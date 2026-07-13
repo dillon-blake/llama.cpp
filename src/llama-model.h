@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-arch.h"
+#include "llama-impl.h" // for LLAMA_API_INTERNAL
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
@@ -661,7 +662,7 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
-    const struct ggml_tensor * get_tensor(const char * name) const;
+    LLAMA_API_INTERNAL const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

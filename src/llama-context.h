@@ -58,15 +58,15 @@ struct llama_context {
     void synchronize();
 
     const llama_model   & get_model()   const;
-    const llama_cparams & get_cparams() const;
+    LLAMA_API_INTERNAL const llama_cparams & get_cparams() const;
 
-    ggml_backend_sched_t get_sched() const;
+    LLAMA_API_INTERNAL ggml_backend_sched_t get_sched() const;
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;
-    uint32_t n_ubatch()  const;
-    uint32_t n_seq_max() const;
+    LLAMA_API_INTERNAL uint32_t n_ubatch()  const;
+    LLAMA_API_INTERNAL uint32_t n_seq_max() const;
 
     uint32_t n_threads()       const;
     uint32_t n_threads_batch() const;
@@ -256,7 +256,7 @@ struct llama_context {
     // Run one forward (+ backward + optimizer step, if `train`) over `batch`.
     //
     // Returns 0 on success, or a negative value on failure.
-    int32_t opt_step_custom(
+    LLAMA_API_INTERNAL int32_t opt_step_custom(
             llama_batch        &      batch,
             ggml_opt_context_t        opt_ctx,
             ggml_opt_result_t         result,
@@ -270,7 +270,7 @@ struct llama_context {
     // Training graphs must bypass the KV cache (S1-00), and that decision is made from
     // cparams.training at graph-build time. A caller that owns its own ggml_opt context -- as
     // the learning-llamas shim does, so that it can choose the loss -- still needs to set this.
-    void set_training(bool value);
+    LLAMA_API_INTERNAL void set_training(bool value);
 
 private:
     //
