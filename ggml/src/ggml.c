@@ -6848,6 +6848,24 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_soft_max_ext_back(ctx, grad, tensor, scale, max_bias));
             }
             GGML_ASSERT((!src1 || !src1_needs_grads) && "backward pass for softmax mask not implemented");
+
+            // The ATTENTION SINK (src2) has a perfectly good gradient. It is simply not implemented,
+            // and until it is, asking for it must be an error rather than a silent zero.
+            //
+            // A sink is an extra logit that takes part in the normalization but produces no output,
+            // so the rows sum to 1 - p_sink rather than to 1. Its gradient is
+            //
+            //     dL/ds = -p_sink * dot(y, dy)      where p_sink = 1 - sum(y)
+            //
+            // -- computable from y and dy alone, without the sink's own value, and verified against
+            // a float64 finite difference. It needs a reduction from the [n_kv, n_tokens, n_head]
+            // gradient down to the [n_head] sink tensor, which is why it is not a one-liner.
+            //
+            // LoRA does not train sinks, so nothing in this project needs it today. But a full
+            // fine-tune would, and returning nothing while saying nothing is how a model gets
+            // trained with one of its parameters silently frozen.
+            GGML_ASSERT((!src2 || !src2_needs_grads) &&
+                        "backward pass for softmax sinks not implemented: dL/ds = -(1 - sum(y)) * dot(y, dy)");
         } break;
         case GGML_OP_ROPE: {
             if (src0_needs_grads) {
