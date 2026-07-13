@@ -3387,6 +3387,20 @@ int32_t llama_context::opt_step_custom(
         pos += (int32_t) ubatch.n_tokens;
     } while (mctx->next());
 
+    // Drop the cached graph before anyone can try to reuse it.
+    //
+    // The loop above builds into gf_res_prev -- llama_context's one-entry graph cache -- but the
+    // graph's NODES live in ctx_compute_opt, which is freed at the end of every step. So on the way
+    // out, gf_res_prev holds a graph whose memory is gone.
+    //
+    // Nothing notices until something calls llama_decode on the same context. decode() asks
+    // gf_res_prev->can_reuse(...), which walks that freed graph's inputs, and the process dies
+    // somewhere with no connection to training at all. (Found as a segfault in DPO, whose reference
+    // pass decodes on a context that has just trained.)
+    //
+    // Resetting it costs one graph rebuild on the next decode and removes the trap entirely.
+    gf_res_prev->reset();
+
     return 0;
 }
 
