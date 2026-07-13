@@ -2767,6 +2767,37 @@ extern "C" {
         struct ggml_cgraph  *  cgraph,
         struct ggml_tensor  ** grad_accs);
 
+    // Gradient checkpointing: the same gradients, computed while keeping far fewer activations.
+    //
+    // An ordinary backward pass reads the forward pass's intermediates, so every one of them stays
+    // live from where it is produced to where its gradient is taken -- for the first layer, that is
+    // the whole graph. At long context it is activations, not weights, that exhaust memory.
+    //
+    // Given a set of `checkpoints` (layer boundaries, typically), this builds `gb` so that only
+    // those survive the forward pass. Every other intermediate is RECOMPUTED from the nearest
+    // checkpoint, immediately before the backward node that reads it, and is dead again directly
+    // after -- so at most one segment's interior is ever live. One extra forward of arithmetic buys
+    // an O(n_layers) cut in activation memory.
+    //
+    // The gradient rules are untouched: only the tensor each backward node *reads* changes, from
+    // the original activation to a stand-in holding the same numbers. The result is therefore
+    // bit-for-bit identical to ggml_build_backward_expand's, and that is worth testing rather than
+    // assuming.
+    //
+    //   gf: the forward graph. Not modified.
+    //   gb: out. Must be created with grads = true, and sized for the forward, the backward, AND
+    //       the recompute nodes -- roughly two forwards plus a backward.
+    //
+    // gb's forward prefix is gf's, in gf's order, because ggml-opt indexes its gradient
+    // accumulators and AdamW momenta by forward node index.
+    GGML_API void ggml_build_backward_expand_checkpointed(
+        struct ggml_context *  ctx,
+        struct ggml_cgraph  *  gf,
+        struct ggml_cgraph  *  gb,
+        struct ggml_tensor  ** grad_accs,
+        struct ggml_tensor  ** checkpoints,
+        int                    n_checkpoints);
+
     // graph allocation in a context
     GGML_API struct ggml_cgraph * ggml_new_graph       (struct ggml_context * ctx); // size = GGML_DEFAULT_GRAPH_SIZE, grads = false
     GGML_API struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t size, bool grads);

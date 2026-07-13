@@ -7307,6 +7307,173 @@ void ggml_build_backward_expand(
     free(grads_needed);
 }
 
+// gradient checkpointing
+//
+// The backward pass reads the forward pass's intermediate activations. So in an ordinary
+// forward+backward graph every one of them stays live from the moment it is produced until the
+// moment its gradient is taken -- which, for the first layer, is the entire graph. Activations,
+// not weights, are what makes a long-context training step run out of memory.
+//
+// Checkpointing keeps only a handful of them -- the layer boundaries -- and RECOMPUTES the rest
+// from the nearest one, immediately before the backward node that wants them. The recomputed copy
+// dies as soon as that segment's backward is done, so the allocator only ever has one segment's
+// interior live. It costs one extra forward pass of arithmetic and saves O(n_layers) of memory.
+//
+// The gradients themselves are not touched: ggml_build_backward_expand already computes them
+// correctly. All that changes is WHICH tensor each backward node reads -- the original activation,
+// or a recomputed stand-in holding the same numbers. That is why the result is bit-for-bit what
+// the unchecked path produces, and it is the property the tests pin.
+
+struct ggml_recompute_map {
+    struct ggml_hash_set   set;
+    struct ggml_tensor  ** vals;
+};
+
+// The stand-in for `node` in the checkpointed graph: `node` itself if it survives the forward,
+// otherwise a fresh node that recomputes it from whatever does.
+static struct ggml_tensor * ggml_recompute_node(
+        struct ggml_context       * ctx,
+        const struct ggml_cgraph  * gf,
+        struct ggml_recompute_map * map,
+        struct ggml_tensor        * node) {
+    if (node == NULL) {
+        return NULL;
+    }
+
+    // Leafs, weights, and anything the forward graph did not produce stand for themselves: they
+    // are alive regardless, and there is nothing to recompute them from.
+    if (node->op == GGML_OP_NONE || (node->flags & GGML_TENSOR_FLAG_PARAM)) {
+        return node;
+    }
+    if (!ggml_hash_contains(&gf->visited_hash_set, node)) {
+        return node;
+    }
+
+    // A checkpoint -- or something already recomputed, which must be reused rather than cloned a
+    // second time, or a diamond in the graph would double the work and the memory.
+    const size_t found = ggml_hash_find(&map->set, node);
+    if (found != GGML_HASHSET_FULL && ggml_bitset_get(map->set.used, found)) {
+        return map->vals[found];
+    }
+
+    struct ggml_tensor * clone = ggml_new_tensor(ctx, node->type, GGML_MAX_DIMS, node->ne);
+
+    clone->op = node->op;
+    memcpy(clone->op_params, node->op_params, sizeof(clone->op_params));
+    memcpy(clone->nb,        node->nb,        sizeof(clone->nb));
+
+    // Deliberately NOT node->flags. A recomputed node is not a parameter, not the loss, and not a
+    // graph output -- and each of those flags is a request to the allocator to keep the tensor
+    // alive, which is the exact thing this is trying to avoid.
+
+    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+        clone->src[k] = ggml_recompute_node(ctx, gf, map, node->src[k]);
+    }
+
+    // A view op computes nothing: ggml_compute_forward_reshape and its siblings are literal no-ops,
+    // and the data is read through view_src. A clone with a null view_src would therefore be handed
+    // to the backward pass full of uninitialized memory -- silently, and only under checkpointing.
+    // Point the view at the RECOMPUTED base, which is the entire point of the exercise.
+    if (node->view_src != NULL) {
+        struct ggml_tensor * base = ggml_recompute_node(ctx, gf, map, node->view_src);
+
+        // Same normalization ggml_new_tensor_impl does: view_src is always the root of the view
+        // chain, and view_offs is absolute from it.
+        clone->view_src  = base->view_src ? base->view_src : base;
+        clone->view_offs = node->view_offs + (base->view_src ? base->view_offs : 0);
+    }
+
+    ggml_format_name(clone, "%s (recomputed)", node->name);
+
+    const size_t slot = ggml_hash_insert(&map->set, node);
+    GGML_ASSERT(slot != GGML_HASHSET_FULL && slot != GGML_HASHSET_ALREADY_EXISTS);
+    map->vals[slot] = clone;
+
+    return clone;
+}
+
+void ggml_build_backward_expand_checkpointed(
+        struct ggml_context *  ctx,
+        struct ggml_cgraph  *  gf,
+        struct ggml_cgraph  *  gb,
+        struct ggml_tensor  ** grad_accs,
+        struct ggml_tensor  ** checkpoints,
+        int                    n_checkpoints) {
+    GGML_ASSERT(gf->n_nodes > 0);
+    GGML_ASSERT(gb->grads && gb->grad_accs);
+
+    // The ordinary backward, into a scratch graph. Everything below rewrites its nodes' *reads*;
+    // the gradient rules themselves are ggml's and are not second-guessed.
+    struct ggml_cgraph * gb_tmp = ggml_graph_dup(ctx, gf, /*force_grads =*/ true);
+    ggml_build_backward_expand(ctx, gb_tmp, grad_accs);
+
+    if (n_checkpoints <= 0) {
+        ggml_graph_cpy(gb_tmp, gb);
+        return;
+    }
+
+    struct ggml_recompute_map map;
+    map.set  = ggml_hash_set_new(gf->visited_hash_set.size);
+    map.vals = calloc(map.set.size, sizeof(struct ggml_tensor *));
+    GGML_ASSERT(map.vals);
+
+    // A checkpoint stands for itself. That is what makes it a checkpoint: it survives the forward,
+    // so the backward may read it directly, and the recompute recursion terminates there.
+    for (int i = 0; i < n_checkpoints; ++i) {
+        const size_t slot = ggml_hash_insert(&map.set, checkpoints[i]);
+        if (slot == GGML_HASHSET_ALREADY_EXISTS) {
+            continue;
+        }
+        GGML_ASSERT(slot != GGML_HASHSET_FULL);
+        map.vals[slot] = checkpoints[i];
+    }
+
+    // gb opens with the forward graph, unchanged and in the same order. That is not cosmetic:
+    // ggml-opt sizes and indexes its gradient accumulators and AdamW momenta by FORWARD node
+    // index, so a checkpointed graph whose forward prefix moved would silently apply one
+    // parameter's momentum to another.
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        ggml_build_forward_expand(gb, gf->nodes[i]);
+    }
+
+    // ...then the backward, each node's reads redirected to stand-ins. Expanding a node pulls its
+    // recompute chain in immediately ahead of it, which is what confines a segment's interior
+    // activations to that segment's backward.
+    for (int i = gf->n_nodes; i < gb_tmp->n_nodes; ++i) {
+        struct ggml_tensor * node = gb_tmp->nodes[i];
+
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            node->src[k] = ggml_recompute_node(ctx, gf, &map, node->src[k]);
+        }
+
+        ggml_build_forward_expand(gb, node);
+    }
+
+    // The gradient bookkeeping is keyed by tensor, not by position, so it carries over wholesale.
+    for (size_t i = 0; i < gb_tmp->visited_hash_set.size; ++i) {
+        if (!ggml_bitset_get(gb_tmp->visited_hash_set.used, i)) {
+            continue;
+        }
+
+        struct ggml_tensor * key  = gb_tmp->visited_hash_set.keys[i];
+        struct ggml_tensor * grad = gb_tmp->grads     ? gb_tmp->grads[i]     : NULL;
+        struct ggml_tensor * acc  = gb_tmp->grad_accs ? gb_tmp->grad_accs[i] : NULL;
+
+        if (!grad && !acc) {
+            continue;
+        }
+
+        const size_t slot = ggml_hash_find_or_insert(&gb->visited_hash_set, key);
+        GGML_ASSERT(slot != GGML_HASHSET_FULL);
+
+        gb->grads[slot]     = grad;
+        gb->grad_accs[slot] = acc;
+    }
+
+    ggml_hash_set_free(&map.set);
+    free(map.vals);
+}
+
 static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     void * ptr = *p;
     ptr = (void *) GGML_PAD((uintptr_t) ptr, align);

@@ -2300,6 +2300,19 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
+
+    // A training graph is the forward graph AND its backward, and the backward is the bigger half:
+    // every op's VJP is one node or several. This bound was written for inference, and using it for
+    // training works right up until the model is deep enough that forward + backward overflows it --
+    // at which point ggml aborts inside ggml_build_forward_expand on `n_nodes < size`, with nothing
+    // to say it was a sizing problem.
+    //
+    // A 2-layer model never gets there. A 12-layer one does. (Gradient checkpointing, S1-17, adds a
+    // third graph's worth of recompute nodes on top, which is the rest of the headroom.)
+    if (cparams.training) {
+        res *= 4;
+    }
+
     return res;
 }
 
@@ -3262,7 +3275,60 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     }
 }
 
+void llama_context::set_grad_checkpointing(uint32_t segment_len) {
+    grad_ckpt_segment = segment_len;
+}
+
+// The layer boundaries of `gf`: the tensors gradient checkpointing keeps, and recomputes everything
+// between.
+//
+// Layer *inputs* rather than outputs, because layer il's input is layer il-1's output -- the same
+// tensor -- and asking for the inputs gets the chain right at both ends without a special case.
+//
+// t_layer_inp is the fork's record of them (llama-graph.h). Not every architecture populates it, so
+// there is a fallback onto the "l_out" naming convention that ~108 model builders follow. If
+// neither yields a boundary chain, the caller gets an empty vector and checkpointing turns itself
+// off rather than silently checkpointing nothing and charging for it.
+static std::vector<ggml_tensor *> llama_graph_layer_boundaries(
+        const llm_graph_result * res,
+        ggml_cgraph            * gf,
+        uint32_t                 n_layer,
+        uint32_t                 segment_len) {
+    std::vector<ggml_tensor *> boundaries;
+
+    for (uint32_t il = 0; il < n_layer; il += segment_len) {
+        ggml_tensor * inp = res->get_layer_inp((int) il);
+        if (inp == nullptr) {
+            boundaries.clear();
+            break;
+        }
+        boundaries.push_back(inp);
+    }
+
+    if (!boundaries.empty()) {
+        return boundaries;
+    }
+
+    // Fallback: the "l_out-<il>" naming convention. Layer il's input is layer il-1's output, so a
+    // boundary at il is the node named l_out-(il-1); il == 0 needs no checkpoint, since the
+    // embedding lookup that feeds it is a leaf and survives anyway.
+    for (uint32_t il = segment_len; il < n_layer; il += segment_len) {
+        char name[GGML_MAX_NAME];
+        snprintf(name, sizeof(name), "l_out-%d", (int) il - 1);
+
+        ggml_tensor * node = ggml_graph_get_tensor(gf, name);
+        if (node == nullptr) {
+            return {};
+        }
+        boundaries.push_back(node);
+    }
+
+    return boundaries;
+}
+
 void llama_context::set_training(bool value) {
+    const bool was_training = cparams.training;
+
     cparams.training = value;
 
     if (value && cparams.flash_attn) {
@@ -3273,6 +3339,31 @@ void llama_context::set_training(bool value) {
         LLAMA_LOG_WARN("%s: disabling flash attention for training (no backward pass)\n", __func__);
         cparams.flash_attn = false;
     }
+
+    if (value != was_training) {
+        // The graph buffers and the scheduler were sized by graph_max_nodes() in the constructor,
+        // when this was still an inference context. A training graph is the forward graph AND its
+        // backward, which needs several times the nodes -- so they are resized here, now that we
+        // know what kind of context this is.
+        //
+        // Without this, the first model deep enough for forward+backward to exceed an inference
+        // graph's node budget aborts inside ggml_build_forward_expand on `n_nodes < size`, and the
+        // abort says nothing about sizing. Two layers fit. Twelve do not.
+        //
+        // Safe here and nowhere else: set_training runs before any graph is built on this context.
+        const uint32_t n_tokens  = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const size_t   max_nodes = graph_max_nodes(n_tokens);
+
+        gf_res_prev.reset(new llm_graph_result(max_nodes));
+        gf_res_reserve.reset(new llm_graph_result(max_nodes));
+
+        sched.reset(ggml_backend_sched_new(
+            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
+            cparams.pipeline_parallel, cparams.op_offload));
+
+        sched_reserve();
+    }
+
 }
 
 // learning-llamas (S1-02). Structurally a fork of opt_epoch_iter below: same batch/ubatch
@@ -3346,9 +3437,16 @@ int32_t llama_context::opt_step_custom(
 
         ggml_context * ctx_compute_opt;
         {
-            const size_t size_gf   = ggml_graph_size(gf);
-            const size_t size_meta = 4*size_gf*ggml_tensor_overhead()
-                                   + 2*ggml_graph_overhead_custom(size_gf, /*grads =*/ true);
+            const size_t size_gf = ggml_graph_size(gf);
+
+            // Checkpointing adds a forward pass's worth of recompute NODES, and its gb graphs are
+            // built at twice gf's size to hold them. This arena is metadata only -- tensor structs
+            // and graph headers, no tensor data -- so the extra is cheap, but it does have to be
+            // there: running out of it inside ggml_new_tensor is an abort, not an error return.
+            const size_t meta_mul = grad_ckpt_segment > 0 ? 3 : 1;
+
+            const size_t size_meta = meta_mul*4*size_gf*ggml_tensor_overhead()
+                                   + meta_mul*2*ggml_graph_overhead_custom(size_gf, /*grads =*/ true);
             ggml_init_params ip = {
                 /*.mem_size   =*/ size_meta,
                 /*.mem_buffer =*/ nullptr,
@@ -3369,6 +3467,21 @@ int32_t llama_context::opt_step_custom(
         }
 
         ggml_opt_prepare_alloc(opt_ctx_, ctx_compute_opt, gf, res->get_inp_tokens(), loss);
+
+        // Between prepare_alloc and alloc, and nowhere else: the checkpoints are nodes of the graph
+        // prepare_alloc was just handed, and alloc is what builds the backward that uses them.
+        if (grad_ckpt_segment > 0 && train) {
+            std::vector<ggml_tensor *> boundaries = llama_graph_layer_boundaries(
+                res, gf, model.hparams.n_layer(), grad_ckpt_segment);
+
+            if (boundaries.empty()) {
+                LLAMA_LOG_WARN("%s: gradient checkpointing is on, but this architecture exposes no "
+                               "layer boundaries -- running without it\n", __func__);
+            } else {
+                ggml_opt_set_checkpoints(opt_ctx_, boundaries.data(), (int) boundaries.size());
+            }
+        }
+
         ggml_opt_alloc(opt_ctx_, train);
 
         // Uploads the token ids and the attention mask.

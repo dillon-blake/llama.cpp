@@ -265,12 +265,23 @@ struct llama_context {
             void *                    loss_ud,
             bool                      train);
 
+    // Gradient checkpointing: keep only every `segment_len`-th layer boundary across the backward
+    // pass and recompute the layers in between (S1-17). 0 = off, which is the default and is
+    // byte-for-byte the ordinary path.
+    //
+    // Costs one extra forward pass of arithmetic. Buys an activation footprint that stops growing
+    // with depth -- which at long context is the difference between training and not.
+    LLAMA_API_INTERNAL void set_grad_checkpointing(uint32_t segment_len);
+
     // Put the context into training mode without going through llama_opt_init.
     //
     // Training graphs must bypass the KV cache (S1-00), and that decision is made from
     // cparams.training at graph-build time. A caller that owns its own ggml_opt context -- as
     // the learning-llamas shim does, so that it can choose the loss -- still needs to set this.
     LLAMA_API_INTERNAL void set_training(bool value);
+
+    // 0 = off. See set_grad_checkpointing.
+    uint32_t grad_ckpt_segment = 0;
 
 private:
     //

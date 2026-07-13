@@ -210,6 +210,21 @@ extern "C" {
         struct ggml_tensor  * inputs,
         struct ggml_tensor  * outputs);
 
+    // Gradient checkpointing: which forward tensors survive the backward pass.
+    //
+    // Everything BETWEEN consecutive checkpoints is recomputed on demand in the backward, instead
+    // of being kept live from the forward -- one extra forward's arithmetic, in exchange for an
+    // activation footprint that stops growing with depth. See
+    // ggml_build_backward_expand_checkpointed. Passing NULL/0 turns it off, which is the default.
+    //
+    // Must be called AFTER ggml_opt_prepare_alloc and before ggml_opt_alloc, and on every step:
+    // these are nodes of the graph prepare_alloc was just handed, and with dynamic graphs that is
+    // a new graph each time. prepare_alloc clears them for exactly that reason.
+    GGML_API void ggml_opt_set_checkpoints(
+        ggml_opt_context_t    opt_ctx,
+        struct ggml_tensor ** checkpoints,
+        int                   n_checkpoints);
+
     // allocate the next graph for evaluation, either forward or forward + backward
     // must be called exactly once prior to calling ggml_opt_eval
     GGML_API void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);
