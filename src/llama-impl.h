@@ -1,10 +1,28 @@
 #pragma once
 
-#include "ggml.h" // for ggml_log_level
+#include "ggml.h"  // for ggml_log_level
+#include "llama.h" // for LLAMA_API
 
 #include <string>
 #include <type_traits>
 #include <vector>
+
+//
+// exporting internals
+//
+// learning-llamas builds its shim against llama.cpp's *internal* C++ classes -- deliberately, and
+// that is the whole design (ADR-0001): it needs ggml_opt-level access to the graph that the public
+// C API does not, and should not, expose.
+//
+// On ELF a shared library exports every symbol by default, so the shim links for free and nobody
+// has to think about this. A PE DLL exports NOTHING unless it is declared, so on Windows every
+// internal the shim reaches for has to say so out loud -- otherwise it is an unresolved external at
+// link time, and the failure looks like a build-system problem rather than what it is.
+//
+// LLAMA_API_INTERNAL is that declaration. It is deliberately not LLAMA_API: these carry no
+// stability promise, and grepping for this macro tells you exactly how far the shim reaches into
+// llama.cpp -- which is the coupling surface a submodule bump has to re-check.
+#define LLAMA_API_INTERNAL LLAMA_API
 
 #ifdef __GNUC__
 #    if defined(__MINGW32__) && !defined(__clang__)
@@ -21,7 +39,7 @@
 //
 
 LLAMA_ATTRIBUTE_FORMAT(2, 3)
-void llama_log_internal        (ggml_log_level level, const char * format, ...);
+LLAMA_API_INTERNAL void llama_log_internal(ggml_log_level level, const char * format, ...);
 void llama_log_callback_default(ggml_log_level level, const char * text, void * user_data);
 
 #define LLAMA_LOG(...)       llama_log_internal(GGML_LOG_LEVEL_NONE , __VA_ARGS__)
