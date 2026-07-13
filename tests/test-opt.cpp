@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "ggml-opt.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cinttypes>
 #include <cstring>
@@ -969,6 +970,196 @@ static std::pair<int, int> test_dynamic_graph_opt_period(
     return std::make_pair(npass, ntest);
 }
 
+// A learning rate big enough that the weights actually MOVE, with AdamW's usual momenta.
+//
+// The default alpha of 1e-3 is useless for a resume test: the weights barely shift, so the gradient
+// barely changes, so the moments carry almost no history -- and a run resumed from the weights alone
+// then reproduces the uninterrupted one to within 1e-6 anyway. The counterfactual would pass while
+// proving nothing. (helper_get_test_opt_pars is no good either: it sets beta1 = beta2 = 0, i.e. no
+// momentum at all, which is exactly the state being tested for.)
+static ggml_opt_optimizer_params resume_opt_pars(void * userdata) {
+    ggml_opt_optimizer_params result = ggml_opt_get_default_optimizer_params(userdata);
+    result.adamw.alpha = 0.3f;
+    return result;
+}
+
+// The AdamW moments and the iteration counter are what a resume has to restore.
+//
+// Restarting from the weights alone restarts the OPTIMIZER from a standing start: m and v are zero
+// and the bias correction is back at iteration 1, so the first steps after a resume are much larger
+// than the ones they follow. The loss curve jumps at every restart and nothing says why.
+//
+// This asserts the property directly, which is the only way to be sure the accessors expose the
+// right tensors: run N steps; then run N steps again from the same weights but with the moments and
+// the iteration counter restored from step N; the trajectory must CONTINUE, not restart. Compared
+// against a reference run of 2N steps, which never stopped -- and compared bit for bit, because a
+// correct resume is not an approximation of an uninterrupted run, it IS one.
+static std::pair<int, int> test_dynamic_graph_resume(
+        enum ggml_opt_optimizer_type optim, ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+    int npass = 0;
+    int ntest = 0;
+
+    if (optim != GGML_OPT_OPTIMIZER_TYPE_ADAMW) {
+        return std::make_pair(npass, ntest);  // only AdamW carries momenta to restore
+    }
+
+    constexpr int64_t ne     = 4;
+    constexpr int     n_half = 3;
+
+    const std::vector<float> x_data = {1.0f, 2.0f, 3.0f, 4.0f};
+    const std::vector<float> w_init(ne, 1.0f);
+
+    struct state {
+        std::vector<float> w;
+        std::vector<float> m;
+        std::vector<float> v;
+        int64_t iter;
+    };
+
+    // Run `steps` steps, optionally starting from a saved state. Returns where it ended up.
+    auto run = [&](int steps, const state * from) {
+        ggml_context * ctx_static;
+        {
+            ggml_init_params params = {
+                /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ctx_static = ggml_init(params);
+        }
+
+        ggml_tensor * weights = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, ne);
+        ggml_set_name(weights, "weights");
+        ggml_set_param(weights);
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+        ggml_backend_tensor_set(weights, from ? from->w.data() : w_init.data(), 0, ne*sizeof(float));
+
+        ggml_opt_params opt_params = ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_SUM);
+        opt_params.ctx_compute  = nullptr;
+        opt_params.opt_period   = 1;
+        opt_params.optimizer    = optim;
+        opt_params.get_opt_pars = resume_opt_pars;
+        ggml_opt_context_t opt_ctx = ggml_opt_init(opt_params);
+
+        state out;
+
+        for (int i = 0; i < steps; ++i) {
+            ggml_tensor * grad_acc = nullptr;
+            ggml_tensor * m = nullptr;
+            ggml_tensor * v = nullptr;
+
+            // The graphs exist only between alloc and eval, so the moments must be restored (and
+            // captured) from inside the step. That is not an implementation detail of this test --
+            // it is the constraint the shim's checkpoint code lives under too.
+            {
+                ggml_context * ctx_compute;
+                {
+                    ggml_init_params params = {
+                        /*.mem_size   =*/ 1024*ggml_tensor_overhead() + 8*ggml_graph_overhead(),
+                        /*.mem_buffer =*/ nullptr,
+                        /*.no_alloc   =*/ true,
+                    };
+                    ctx_compute = ggml_init(params);
+                }
+
+                ggml_tensor * inputs = ggml_new_tensor_1d(ctx_compute, GGML_TYPE_F32, ne);
+                ggml_set_input(inputs);
+
+                // loss = sum((x*w)^2), so dL/dw = 2*x^2*w -- a gradient that CHANGES as w moves.
+                //
+                // The linear model the other cases use (loss = sum(x*w), dL/dw = x) is useless here:
+                // with a constant gradient, AdamW's bias correction makes m_hat/sqrt(v_hat) exactly
+                // the same on every step, so a run resumed from the weights alone is
+                // indistinguishable from one that never stopped. The optimizer state carries no
+                // history to lose. The counterfactual below would pass while proving nothing.
+                ggml_tensor * outputs = ggml_sqr(ctx_compute, ggml_mul(ctx_compute, inputs, weights));
+
+                ggml_cgraph * gf = ggml_new_graph(ctx_compute);
+                ggml_build_forward_expand(gf, outputs);
+
+                ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
+                ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+
+                ggml_backend_tensor_set(inputs, x_data.data(), 0, ne*sizeof(float));
+
+                grad_acc = ggml_opt_grad_acc(opt_ctx, weights);
+                m        = ggml_opt_grad_m  (opt_ctx, weights);
+                v        = ggml_opt_grad_v  (opt_ctx, weights);
+
+                if (i == 0 && from) {
+                    ggml_backend_tensor_set(m, from->m.data(), 0, ne*sizeof(float));
+                    ggml_backend_tensor_set(v, from->v.data(), 0, ne*sizeof(float));
+                    ggml_opt_set_iter(opt_ctx, from->iter);
+                }
+
+                ggml_opt_eval(opt_ctx, nullptr);
+
+                ggml_free(ctx_compute);
+            }
+
+            if (i == steps - 1) {
+                out.w.resize(ne);
+                out.m.resize(ne);
+                out.v.resize(ne);
+                ggml_backend_tensor_get(weights, out.w.data(), 0, ne*sizeof(float));
+                ggml_backend_tensor_get(m,       out.m.data(), 0, ne*sizeof(float));
+                ggml_backend_tensor_get(v,       out.v.data(), 0, ne*sizeof(float));
+                out.iter = ggml_opt_get_iter(opt_ctx);
+            }
+
+            (void) grad_acc;
+        }
+
+        ggml_opt_free(opt_ctx);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx_static);
+
+        return out;
+    };
+
+    const state uninterrupted = run(2*n_half, nullptr);   // the reference: never stopped
+    const state halfway       = run(n_half,   nullptr);   // ...and a run that did
+
+    {
+        // The moments are not zero at the halfway point, or restoring them would prove nothing.
+        bool nonzero = false;
+        for (int64_t i = 0; i < ne; ++i) {
+            nonzero = nonzero || halfway.m[i] != 0.0f || halfway.v[i] != 0.0f;
+        }
+        print_ok(__func__, nonzero && halfway.iter > 1, npass, ntest, "the moments and iter are live");
+    }
+
+    {
+        const state resumed = run(n_half, &halfway);
+
+        bool subtest_ok = resumed.iter == uninterrupted.iter;
+        for (int64_t i = 0; i < ne; ++i) {
+            subtest_ok = subtest_ok && resumed.w[i] == uninterrupted.w[i];
+        }
+        print_ok(__func__, subtest_ok, npass, ntest, "a resumed run IS the uninterrupted one, bit for bit");
+    }
+
+    {
+        // The counterfactual, and the reason the accessors are worth having: resume from the
+        // WEIGHTS alone -- the thing a naive checkpoint saves -- and the trajectory diverges.
+        state weights_only = halfway;
+        std::fill(weights_only.m.begin(), weights_only.m.end(), 0.0f);
+        std::fill(weights_only.v.begin(), weights_only.v.end(), 0.0f);
+        weights_only.iter = 1;
+
+        const state resumed = run(n_half, &weights_only);
+
+        bool diverged = false;
+        for (int64_t i = 0; i < ne; ++i) {
+            diverged = diverged || !almost_equal(resumed.w[i], uninterrupted.w[i], 1e-3);
+        }
+        print_ok(__func__, diverged, npass, ntest, "resuming from the weights alone does NOT reproduce it");
+    }
+
+    return std::make_pair(npass, ntest);
+}
+
 // Global-norm gradient clipping rescales the gradient and does not rotate it.
 //
 // The model is linear in the weights (loss = sum(x*w), so dL/dw = x), which makes the gradient known
@@ -1218,6 +1409,11 @@ static std::pair<int, int> test_backend(
     }
     {
         std::pair<int, int> partial = test_dynamic_graph_grad_clip(optim, backend_sched, backend);
+        npass += partial.first;
+        ntest += partial.second;
+    }
+    {
+        std::pair<int, int> partial = test_dynamic_graph_resume(optim, backend_sched, backend);
         npass += partial.first;
         ntest += partial.second;
     }

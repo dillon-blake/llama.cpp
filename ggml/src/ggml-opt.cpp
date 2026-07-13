@@ -712,6 +712,42 @@ struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_t
     return ggml_graph_get_grad_acc(opt_ctx->gb_opt, node);
 }
 
+// grad_m and grad_v are indexed by the node's position in the FORWARD graph -- that is how
+// ggml_opt_build fills them (see the need_momenta loop) and how it reads them back when it builds
+// the opt-step nodes. So the lookup is a scan of gf, not a hash of gb_opt.
+static int ggml_opt_node_index(ggml_opt_context_t opt_ctx, struct ggml_tensor * node) {
+    if (!opt_ctx->gf) {
+        return -1;
+    }
+
+    for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+        if (opt_ctx->gf->nodes[i] == node) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+struct ggml_tensor * ggml_opt_grad_m(ggml_opt_context_t opt_ctx, struct ggml_tensor * node) {
+    const int i = ggml_opt_node_index(opt_ctx, node);
+    return i >= 0 && i < int(opt_ctx->grad_m.size()) ? opt_ctx->grad_m[i] : nullptr;
+}
+
+struct ggml_tensor * ggml_opt_grad_v(ggml_opt_context_t opt_ctx, struct ggml_tensor * node) {
+    const int i = ggml_opt_node_index(opt_ctx, node);
+    return i >= 0 && i < int(opt_ctx->grad_v.size()) ? opt_ctx->grad_v[i] : nullptr;
+}
+
+int64_t ggml_opt_get_iter(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->iter;
+}
+
+void ggml_opt_set_iter(ggml_opt_context_t opt_ctx, int64_t iter) {
+    GGML_ASSERT(iter >= 1);
+    opt_ctx->iter = iter;
+}
+
 // ====== Optimization Result ======
 
 ggml_opt_result_t ggml_opt_result_init() {
