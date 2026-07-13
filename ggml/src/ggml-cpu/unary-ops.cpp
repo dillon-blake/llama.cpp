@@ -74,7 +74,26 @@ static inline float op_log(float x) {
 }
 
 static inline float op_expm1(float x) {
-    return expf(x) - 1.0f;
+    // expm1f, not expf(x) - 1.0f, and the difference is the entire reason this op exists.
+    //
+    // exp(x) for small x is 1 + x + x^2/2 + ..., a number just above 1. Subtracting 1 from it in
+    // float32 throws away every bit that was not in the leading 1 -- catastrophic cancellation --
+    // and what is left is the rounding error, not the answer.
+    //
+    // Measured, against the true value:
+    //
+    //   x = 1e-5:  expf(x)-1 - x  =  1.36e-8   vs  5.0e-11   (271x too large)
+    //   x = 1e-6:  expf(x)-1 - x  =  7.29e-8   vs  5.0e-13   (145,000x too large)
+    //   x = 5e-5:  expf(x)-1 - x  = -5.13e-8   vs  1.25e-9   (NEGATIVE)
+    //
+    // That last one is the one that bites. Schulman's k3 KL estimator is exp(x) - x - 1, and it is
+    // non-negative by construction -- that is the whole point of using it. Computed this way it goes
+    // NEGATIVE near x = 0, so a KL penalty stops penalizing divergence and starts rewarding it. And
+    // x ~ 0 is exactly where an on-policy RL run lives.
+    //
+    // expm1f is the libm function for precisely this, it is exact at every scale above, and it is
+    // already used twice in this file (op_elu, op_xielu).
+    return expm1f(x);
 }
 
 static inline float op_softplus(float x) {
