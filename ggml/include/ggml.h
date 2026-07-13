@@ -592,6 +592,11 @@ extern "C" {
         GGML_OP_CROSS_ENTROPY_LOSS_SPARSE,
         GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK,
 
+        // learning-llamas: the two halves of MUL_MAT_ID's backward (S1-25). Also at the TAIL,
+        // for the same reason as above.
+        GGML_OP_OUT_PROD_ID,
+        GGML_OP_OUT_PROD_ID_GRP,
+
         GGML_OP_COUNT,
     };
 
@@ -1453,6 +1458,40 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // learning-llamas (S1-25): the two halves of MUL_MAT_ID's backward.
+    //
+    // For the forward  dst[j,i,t] = sum_k as[k,j, ids[i,t]] * b[k, i % ne_b1, t]:
+    //
+    //   ggml_out_prod_id     -> d(b)  [n, ne_b1, n_tokens]  : gather the expert matrix each
+    //                           (i,t) slot used and push the gradient back through it. Slots
+    //                           sharing a b column (the ne_b1 == 1 case, which is what
+    //                           build_moe_ffn produces) ACCUMULATE into it.
+    //
+    //   ggml_out_prod_id_grp -> d(as) [n, m, n_expert]      : the outer product b (x) grad,
+    //                           scattered into the expert slice each (i,t) selected, and
+    //                           accumulated -- an expert chosen by many tokens sums them all.
+    //
+    // "grp" is for grouped: it reduces over every (i,t) that routed to a given expert. The
+    // weight-grad half is NOT optional for LoRA-only MoE training, which is the discovery this
+    // ticket turns on: build_lora_mm_id makes the trainable A/B tensors the 3D expert operand
+    // of mul_mat_id itself, so they are `as`, not activations.
+    // ne_b1 is b's middle dim. It cannot be recovered from as/grad/ids -- the forward broadcasts
+    // b's columns across slots whenever ids->ne[0] is a multiple of it -- so it is passed, not
+    // assumed to be 1.
+    GGML_API struct ggml_tensor * ggml_out_prod_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * ids,
+            int64_t               ne_b1);
+
+    GGML_API struct ggml_tensor * ggml_out_prod_id_grp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * ids,
+            int64_t               n_expert);
 
     //
     // operations on tensors without backpropagation

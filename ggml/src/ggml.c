@@ -1097,9 +1097,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "CROSS_ENTROPY_LOSS_SPARSE",
     "CROSS_ENTROPY_LOSS_SPARSE_BACK",
+
+    "OUT_PROD_ID",
+    "OUT_PROD_ID_GRP",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1211,9 +1214,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "cross_entropy_loss_sparse(x,y,w)",
     "cross_entropy_loss_sparse_back(x,y,w)",
+
+    "out_prod_id(as,grad,ids)",
+    "out_prod_id_grp(b,grad,ids)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3362,6 +3368,93 @@ struct ggml_tensor * ggml_out_prod(
     result->op     = GGML_OP_OUT_PROD;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_out_prod_id / ggml_out_prod_id_grp (learning-llamas, S1-25)
+//
+// The two halves of MUL_MAT_ID's backward. Given the forward
+//
+//     mul_mat_id(as, b, ids):  dst[j,i,t] = sum_k as[k,j, ids[i,t]] * b[k, i % ne_b1, t]
+//
+//   as   [n, m, n_expert]     the 3D expert stack
+//   b    [n, ne_b1, n_tok]    activations; ne_b1 is 1 in every build_moe_ffn graph
+//   ids  [n_ids, n_tok] I32   which experts token t routed to
+//   dst  [m, n_ids, n_tok]
+//
+// the gradients are
+//
+//     d(b) [k, l, t]     = sum_{i : i % ne_b1 == l} sum_j grad[j,i,t] * as[k,j, ids[i,t]]
+//     d(as)[k, j, e]     = sum_{(i,t) : ids[i,t] == e}      grad[j,i,t] * b[k, i % ne_b1, t]
+//
+// Both are gather/scatter-with-accumulation, which is why neither is expressible as an existing
+// op: OUT_PROD has no notion of an index tensor, and the expert axis is not a broadcast axis --
+// it is a *selection*. Two experts can be chosen by the same token (different i), and one expert
+// by many tokens; both cases accumulate, and getting that wrong is silent.
+//
+// Kernels land in S1-26 (OUT_PROD_ID) and S1-27 (OUT_PROD_ID_GRP). Until then no backend
+// advertises support, so a graph containing them builds but will not schedule.
+
+struct ggml_tensor * ggml_out_prod_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * ids,
+        int64_t               ne_b1) {
+    GGML_ASSERT(!ggml_is_transposed(as));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(as->ne[3] == 1);                     // as is 3d (one matrix per expert)
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
+    GGML_ASSERT(grad->ne[0] == as->ne[1]);           // grad's row dim is the expert output dim
+    GGML_ASSERT(grad->ne[1] == ids->ne[0]);          // one grad column per (slot, token)
+    GGML_ASSERT(grad->ne[2] == ids->ne[1]);          // ...and one ids row per token
+
+    // d(b) has b's shape, and b's middle dim is NOT recoverable from `as`, `grad` or `ids`: the
+    // forward broadcasts b's columns across slots whenever ids->ne[0] is a multiple of it. Assume
+    // 1 (which is all build_moe_ffn ever produces) and a broadcasting graph would silently get a
+    // wrong-shaped gradient, so take it as an argument and assert the forward's rule instead.
+    GGML_ASSERT(ne_b1 > 0);
+    GGML_ASSERT(ids->ne[0] % ne_b1 == 0);
+
+    const int64_t ne[4] = { as->ne[0], ne_b1, ids->ne[1], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_OUT_PROD_ID;
+    result->src[0] = as;
+    result->src[1] = grad;
+    result->src[2] = ids;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_out_prod_id_grp(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * ids,
+        int64_t               n_expert) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(b->ne[3] == 1);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ids->ne[1] == b->ne[2]);             // one expert list per token
+    GGML_ASSERT(ids->ne[0] % b->ne[1] == 0);         // the forward's broadcast rule
+    GGML_ASSERT(grad->ne[1] == ids->ne[0]);
+    GGML_ASSERT(grad->ne[2] == ids->ne[1]);
+    GGML_ASSERT(n_expert > 0);
+
+    // d(as) has as's shape: [n, m, n_expert].
+    const int64_t ne[4] = { b->ne[0], grad->ne[0], n_expert, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_OUT_PROD_ID_GRP;
+    result->src[0] = b;
+    result->src[1] = grad;
+    result->src[2] = ids;
 
     return result;
 }
@@ -6737,6 +6830,40 @@ static void ggml_compute_backward(
                             ggml_transpose(ctx, // [p,m,qq,rr]
                                 grad)));        // [m,p,qq,rr]
             }
+        } break;
+        case GGML_OP_MUL_MAT_ID: {
+            // learning-llamas (S1-25). src0 = as [n,m,n_expert], src1 = b [n,ne_b1,n_tok],
+            // src2 = ids [n_ids,n_tok] I32. Forward:
+            //
+            //     dst[j,i,t] = sum_k as[k,j, ids[i,t]] * b[k, i % ne_b1, t]
+            //
+            // Both gradients are gather/scatter WITH ACCUMULATION, and neither is expressible in
+            // existing ops -- the expert axis is a selection, not a broadcast. See ggml_out_prod_id.
+            //
+            // src2 is I32 and so is skipped by the grad builder outright; there is nothing to
+            // ignore_src here.
+            //
+            // src0 needing grads is NOT an exotic case. build_lora_mm_id computes
+            // mul_mat_id(B, mul_mat_id(A, cur, ids), ids), which makes the trainable LoRA A and B
+            // the 3D expert operand -- so LoRA-only MoE training needs the WEIGHT-grad half too,
+            // and an "activations only" shortcut would silently train nothing.
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1,
+                        ggml_out_prod_id(ctx, src0, grad, src2, src1->ne[1]));
+            }
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0,
+                        ggml_out_prod_id_grp(ctx, src1, grad, src2, src0->ne[2]));
+            }
+        } break;
+        case GGML_OP_ADD_ID: {
+            // learning-llamas (S1-25). dst is a dup of src0 with a per-expert bias added, so
+            // src0's VJP is the identity. src1 is the bias TABLE -- a frozen base weight; training
+            // it needs a scatter-add and is deferred (ROADMAP E8 / B-09). src2 is I32.
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, grad);
+            }
+            GGML_ASSERT(!src1_needs_grads && "per-expert bias grads are not implemented (ROADMAP E8)");
         } break;
         case GGML_OP_SCALE: {
             if (src0_needs_grads) {
