@@ -165,6 +165,25 @@ extern "C" {
     // get the gradient accumulator for a node from the forward graph
     GGML_API struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
 
+    // The AdamW first and second moments of a parameter, or NULL if it has none (a SGD context, or
+    // a node that is not a parameter).
+    //
+    // These are what a training run has to CHECKPOINT. Restarting from the weights alone restarts
+    // the optimizer from a standing start: AdamW's m and v are zero, its bias correction is back at
+    // iteration 1, and the first few steps after a resume are much larger than the ones they follow.
+    // The loss curve jumps at every resume, and it is not obvious why.
+    //
+    // Like ggml_opt_grad_acc, these are only meaningful in the window between ggml_opt_alloc and
+    // ggml_opt_eval when the graphs are dynamic: eval nulls the graph they are looked up through.
+    // The tensors themselves live in the optimizer's static context and outlive the step.
+    GGML_API struct ggml_tensor * ggml_opt_grad_m(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
+    GGML_API struct ggml_tensor * ggml_opt_grad_v(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
+
+    // The optimizer's iteration counter, which drives AdamW's bias correction (beta1h, beta2h).
+    // Restoring the moments without restoring this corrects them for the wrong iteration.
+    GGML_API int64_t ggml_opt_get_iter(ggml_opt_context_t opt_ctx);
+    GGML_API void    ggml_opt_set_iter(ggml_opt_context_t opt_ctx, int64_t iter);
+
     GGML_API enum ggml_opt_optimizer_type ggml_opt_context_optimizer_type(ggml_opt_context_t); //TODO consistent naming scheme
 
     GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type);
