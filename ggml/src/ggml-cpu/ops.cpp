@@ -4742,6 +4742,192 @@ void ggml_compute_forward_out_prod_id(
     ggml_compute_forward_out_prod_id_f32(params, dst);
 }
 
+// ggml_compute_forward_glu_back  (learning-llamas, S1-28)
+//
+// Every GLU is `y = act(x) * g`, so every GLU's VJP is the same two lines:
+//
+//     dx = dy * g * act'(x)
+//     dg = dy * act(x)
+//
+// and the only thing that varies across the family is act and act'. Writing them out rather than
+// composing them out of existing ops is what makes GEGLU_ERF possible at all -- ggml has no erf op,
+// so `gelu_erf'` is not expressible as a graph.
+//
+// The derivatives, against ggml's OWN scalar forwards in vec.h (not against a paper -- if ggml's
+// gelu uses the tanh approximation then its derivative must be the derivative OF THAT, or the
+// finite difference will disagree and be right to):
+//
+//   silu(x)       = x*s,            s = sigmoid(x)
+//   silu'(x)      = s * (1 + x*(1 - s))
+//   gelu(x)       = 0.5x(1 + T),    u = SQRT_2_OVER_PI*x*(1 + A*x*x),  T = tanh(u),  A = 0.044715
+//   gelu'(x)      = 0.5(1 + T) + 0.5x(1 - T*T) * SQRT_2_OVER_PI*(1 + 3*A*x*x)
+//   gelu_erf(x)   = 0.5x(1 + erf(x/sqrt2))
+//   gelu_erf'(x)  = 0.5(1 + erf(x/sqrt2)) + x * exp(-x*x/2)/sqrt(2*pi)
+//   gelu_quick(x) = x*q,            q = sigmoid(-GELU_QUICK_COEF * x)   [COEF is -1.702]
+//   gelu_quick'(x)= q + x*(-GELU_QUICK_COEF)*q*(1 - q)
+//   reglu(x)      = relu(x);        reglu'(x) = step(x)         [0 at the kink, as ggml_step does]
+//
+// SWIGLU_OAI is the awkward one, because it clamps BOTH halves:
+//
+//   x' = min(x, limit)
+//   y' = clamp(g, -limit, limit)
+//   out = x' * sigmoid(alpha*x') * (y' + 1)
+//
+//   d(out)/dx = [x < limit]        * (s + alpha*x'*s*(1 - s)) * (y' + 1),   s = sigmoid(alpha*x')
+//   d(out)/dg = [|g| < limit]      * x' * s
+//
+// The indicators are ZERO at the clamp bounds -- the same subgradient convention as the landed
+// CLAMP VJP (S1-19) and as ggml_step at 0. That is a real discontinuity, not a rounding artifact,
+// and a finite difference straddling a bound will disagree with it. The grad test narrows its
+// input range so the bounds are not straddled; see test_swiglu_oai.
+static void ggml_compute_forward_glu_back_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * grad = dst->src[0];  // dy, forward-output shape [nc, ...]
+    const ggml_tensor * src0 = dst->src[1];  // a
+    const ggml_tensor * src1 = dst->src[2];  // b, or NULL when fused
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+    if (src1) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+    }
+
+    const enum ggml_glu_op op      = (enum ggml_glu_op) ggml_get_op_params_i32(dst, 0);
+    const bool             swapped = (bool)             ggml_get_op_params_i32(dst, 1);
+    const float            alpha   =                    ggml_get_op_params_f32(dst, 2);
+    const float            limit   =                    ggml_get_op_params_f32(dst, 3);
+
+    const int64_t nc = grad->ne[0];          // the forward's output width
+    const int64_t nr = ggml_nrows(grad);
+
+    GGML_ASSERT(dst->ne[0] == (src1 ? 2*nc : src0->ne[0]));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Row-parallel: each row is written by exactly one thread, so no atomics and no barrier, and
+    // the arithmetic within a row is a fixed sequence. Deterministic by construction (ADR-0002).
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t r = ir0; r < ir1; ++r) {
+        // grad is read through nb[0], NOT indexed as a float*.
+        //
+        // ggml's autodiff hands backward ops TRANSPOSED grads as a matter of course -- the MUL_MAT
+        // backward passes ggml_transpose(grad) straight to ggml_out_prod with no ggml_cont. A
+        // TRANSPOSE node has nb[0] != 4, and a float*[k] read of it silently returns the wrong
+        // element: no assert, no crash, just a wrong gradient. This is the exact bug an adversarial
+        // review found in the S1-26/S1-27 MoE kernels, and this kernel had it too. Verified: the
+        // same logical grad in two memory layouts used to disagree by 1.30.
+        //
+        // src0/src1/dst keep their contiguity asserts -- their rows are walked as float arrays and
+        // a strided read there is unrepresentable, not merely wrong.
+        const char * dy_row = (const char *) grad->data + r*grad->nb[1];
+
+        // Where the two halves live, and where their gradients go. For a fused input both halves
+        // sit in src0 and `swapped` says which is the gate; for a split input they are src0 and
+        // src1 and `swapped` does not apply to the operands at all.
+        const float * xp;   // gate half   (the one act() is applied to)
+        const float * gp;   // linear half
+        float * dxp;        // d(gate)
+        float * dgp;        // d(linear)
+
+        float * d0 = (float *) ((char *) dst->data + r*dst->nb[1]);
+
+        // An odd-width fused `a` has a trailing element the forward never reads (ggml_glu halves
+        // the width with integer division). Its gradient is zero -- but it must be WRITTEN zero,
+        // not left as whatever the allocator handed us.
+        for (int64_t k = 2*nc; k < dst->ne[0]; ++k) {
+            d0[k] = 0.0f;
+        }
+
+        if (src1) {
+            xp  = (const float *) ((const char *) src0->data + r*src0->nb[1]);
+            gp  = (const float *) ((const char *) src1->data + r*src1->nb[1]);
+            dxp = d0;        // half 0 of dst -> d_a
+            dgp = d0 + nc;   // half 1 of dst -> d_b
+        } else {
+            const float * a0 = (const float *) ((const char *) src0->data + r*src0->nb[1]);
+            xp  = a0 + (swapped ? nc : 0);
+            gp  = a0 + (swapped ? 0  : nc);
+            // dst mirrors src0's own layout, so the gradients land back where the halves came from.
+            dxp = d0 + (swapped ? nc : 0);
+            dgp = d0 + (swapped ? 0  : nc);
+        }
+
+        for (int64_t k = 0; k < nc; ++k) {
+            const float x  = xp[k];
+            const float g  = gp[k];
+            const float dy_k = *(const float *) (dy_row + k*grad->nb[0]);
+
+            float act;    // act(x)
+            float dact;   // act'(x)
+
+            switch (op) {
+                case GGML_GLU_OP_REGLU: {
+                    act  = x > 0.0f ? x : 0.0f;
+                    dact = x > 0.0f ? 1.0f : 0.0f;
+                } break;
+                case GGML_GLU_OP_SWIGLU: {
+                    const float s = 1.0f/(1.0f + expf(-x));
+                    act  = x*s;
+                    dact = s*(1.0f + x*(1.0f - s));
+                } break;
+                case GGML_GLU_OP_GEGLU: {
+                    const float x2 = x*x;
+                    const float u  = SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x2);
+                    const float t  = tanhf(u);
+                    act  = 0.5f*x*(1.0f + t);
+                    dact = 0.5f*(1.0f + t) +
+                           0.5f*x*(1.0f - t*t)*SQRT_2_OVER_PI*(1.0f + 3.0f*GELU_COEF_A*x2);
+                } break;
+                case GGML_GLU_OP_GEGLU_ERF: {
+                    const float e = erff(x*SQRT_2_INV);
+                    act  = 0.5f*x*(1.0f + e);
+                    // phi(x) = exp(-x^2/2)/sqrt(2*pi);  1/sqrt(2*pi) == SQRT_2_OVER_PI * 0.5
+                    dact = 0.5f*(1.0f + e) + x*expf(-0.5f*x*x)*(0.5f*SQRT_2_OVER_PI);
+                } break;
+                case GGML_GLU_OP_GEGLU_QUICK: {
+                    const float q = 1.0f/(1.0f + expf(GELU_QUICK_COEF*x));
+                    act  = x*q;
+                    dact = q + x*(-GELU_QUICK_COEF)*q*(1.0f - q);
+                } break;
+                case GGML_GLU_OP_SWIGLU_OAI: {
+                    const float xc = MIN(x, limit);
+                    const float gc = MAX(MIN(g, limit), -limit);
+                    const float s  = 1.0f/(1.0f + expf(alpha*(-xc)));
+
+                    // out = xc*s*(gc + 1). Both clamps contribute a zero subgradient at the bound.
+                    const float dout_dxc = s + alpha*xc*s*(1.0f - s);
+
+                    dxp[k] = (x < limit)                 ? dy_k*dout_dxc*(gc + 1.0f) : 0.0f;
+                    dgp[k] = (g > -limit && g < limit)   ? dy_k*xc*s                 : 0.0f;
+                    continue;  // SWIGLU_OAI does not fit the act/act' shape: it clamps g too.
+                }
+                default: {
+                    GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(op));
+                }
+            }
+
+            dxp[k] = dy_k * g * dact;
+            dgp[k] = dy_k * act;
+        }
+    }
+}
+
+void ggml_compute_forward_glu_back(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    ggml_compute_forward_glu_back_f32(params, dst);
+}
+
 // ggml_compute_forward_scale
 
 static void ggml_compute_forward_scale_f32(

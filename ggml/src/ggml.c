@@ -1100,9 +1100,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "OUT_PROD_ID",
     "OUT_PROD_ID_GRP",
+
+    "GLU_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1217,9 +1219,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "out_prod_id(as,grad,ids)",
     "out_prod_id_grp(b,grad,ids)",
+
+    "glu_back(grad,a,b)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2917,6 +2921,59 @@ static struct ggml_tensor * ggml_glu_impl(
     result->op     = GGML_OP_GLU;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_glu_back (learning-llamas, S1-28)
+
+struct ggml_tensor * ggml_glu_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        enum ggml_glu_op      op,
+        bool                  swapped,
+        float                 alpha,
+        float                 limit) {
+    GGML_ASSERT(ggml_is_contiguous_1(a));
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+
+    if (b) {
+        GGML_ASSERT(ggml_is_contiguous_1(b));
+        GGML_ASSERT(ggml_are_same_shape(a, b));
+        GGML_ASSERT(b->type == GGML_TYPE_F32);
+        GGML_ASSERT(a->ne[0] == grad->ne[0]);      // split: each half is the output width
+    } else {
+        // Fused: a packs both halves. NOT `a->ne[0] == 2*nc` -- ggml_glu computes its output width
+        // as a->ne[0]/2 with INTEGER division, so an odd-width `a` (test-backend-ops sweeps
+        // ne_a[0] = 5) leaves a trailing element the forward never reads. It gets a zero gradient,
+        // and dst has to be wide enough to hold it, or d_a would not be a->ne[0] wide and
+        // ggml_compute_backward's same-shape assert would fire.
+        GGML_ASSERT(a->ne[0] >= 2*grad->ne[0]);
+        GGML_ASSERT(a->ne[0] / 2 == grad->ne[0]);
+    }
+
+    // dst has d_a's shape: the fused input's own width (so the unused tail is representable), or
+    // 2*nc for a split input, where the caller views half 0 as d_a and half 1 as d_b.
+    int64_t ne[GGML_MAX_DIMS] = { b ? 2*grad->ne[0] : a->ne[0] };
+    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+        ne[i] = grad->ne[i];
+    }
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, ne);
+
+    // Same op_param layout as ggml_glu_impl, deliberately: the backward case copies them straight
+    // off the forward node, so a divergence here would be a silent behaviour change.
+    ggml_set_op_params_i32(result, 0, (int32_t) op);
+    ggml_set_op_params_i32(result, 1, (int32_t) swapped);
+    ggml_set_op_params_f32(result, 2, alpha);
+    ggml_set_op_params_f32(result, 3, limit);
+
+    result->op     = GGML_OP_GLU_BACK;
+    result->src[0] = grad;
+    result->src[1] = a;
+    result->src[2] = b;
 
     return result;
 }
@@ -7193,19 +7250,56 @@ static void ggml_compute_backward(
             GGML_ASSERT(!src2_needs_grads && "cross_entropy_loss_sparse: weights are not differentiable");
         } break;
         case GGML_OP_GLU: {
-            switch (ggml_get_glu_op(tensor)) {
-                case GGML_GLU_OP_SWIGLU: {
-                    if (src0_needs_grads) {
-                        GGML_ASSERT(src1 && "backward pass only implemented for split swiglu");
-                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, ggml_mul(ctx, grad, src1), src0));
-                    }
-                    if (src1_needs_grads) {
-                        ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
-                    }
-                } break;
-                default: {
-                    GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
-                } //break;
+            const enum ggml_glu_op glu_op = ggml_get_glu_op(tensor);
+
+            // SPLIT SwiGLU keeps its existing SILU_BACK composite, untouched.
+            //
+            // That is the one path ggml could already differentiate, it is the FFN of every dense
+            // llama, and it is covered by the current MODE_GRAD sweep. Routing it through the new
+            // op would change nothing mathematically and risk a regression in the one place this
+            // project cannot afford one. Everything else -- FUSED SwiGLU (which used to trip
+            // `GGML_ASSERT(src1)`) and the whole REGLU / GEGLU / GEGLU_ERF / GEGLU_QUICK /
+            // SWIGLU_OAI family (which used to GGML_ABORT) -- goes through GLU_BACK (S1-28).
+            if (glu_op == GGML_GLU_OP_SWIGLU && src1) {
+                if (src0_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, ggml_mul(ctx, grad, src1), src0));
+                }
+                if (src1_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
+                }
+                break;
+            }
+
+            if (!src0_needs_grads && !src1_needs_grads) {
+                break;
+            }
+
+            const bool  swapped = ggml_get_op_params_i32(tensor, 1);
+            const float alpha   = ggml_get_op_params_f32(tensor, 2);
+            const float limit   = ggml_get_op_params_f32(tensor, 3);
+
+            // dst is always the FUSED shape [2*nc, ...], whichever way the forward packed itself.
+            struct ggml_tensor * gb = ggml_glu_back(ctx, grad, src0, src1, glu_op, swapped, alpha, limit);
+
+            if (src1) {
+                // Split: half 0 is d_a, half 1 is d_b. `swapped` is already honoured inside the
+                // kernel, so the halves come out in the caller's operand order and these views do
+                // not need to know about it.
+                const int64_t nc = grad->ne[0];
+
+                if (src0_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc0,
+                        ggml_cont(ctx, ggml_view_4d(ctx, gb, nc, gb->ne[1], gb->ne[2], gb->ne[3],
+                                                    gb->nb[1], gb->nb[2], gb->nb[3], 0)));
+                }
+                if (src1_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc1,
+                        ggml_cont(ctx, ggml_view_4d(ctx, gb, nc, gb->ne[1], gb->ne[2], gb->ne[3],
+                                                    gb->nb[1], gb->nb[2], gb->nb[3], nc*gb->nb[0])));
+                }
+            } else {
+                // Fused: dst IS d_a, both halves, in src0's own layout.
+                ggml_add_or_set(ctx, cgraph, isrc0, gb);
             }
         } break;
         case GGML_OP_NONE: {
