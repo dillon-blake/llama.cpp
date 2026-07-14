@@ -4818,7 +4818,18 @@ static void ggml_compute_forward_glu_back_f32(
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
     for (int64_t r = ir0; r < ir1; ++r) {
-        const float * dy = (const float *) ((const char *) grad->data + r*grad->nb[1]);
+        // grad is read through nb[0], NOT indexed as a float*.
+        //
+        // ggml's autodiff hands backward ops TRANSPOSED grads as a matter of course -- the MUL_MAT
+        // backward passes ggml_transpose(grad) straight to ggml_out_prod with no ggml_cont. A
+        // TRANSPOSE node has nb[0] != 4, and a float*[k] read of it silently returns the wrong
+        // element: no assert, no crash, just a wrong gradient. This is the exact bug an adversarial
+        // review found in the S1-26/S1-27 MoE kernels, and this kernel had it too. Verified: the
+        // same logical grad in two memory layouts used to disagree by 1.30.
+        //
+        // src0/src1/dst keep their contiguity asserts -- their rows are walked as float arrays and
+        // a strided read there is unrepresentable, not merely wrong.
+        const char * dy_row = (const char *) grad->data + r*grad->nb[1];
 
         // Where the two halves live, and where their gradients go. For a fused input both halves
         // sit in src0 and `swapped` says which is the gate; for a split input they are src0 and
@@ -4854,7 +4865,7 @@ static void ggml_compute_forward_glu_back_f32(
         for (int64_t k = 0; k < nc; ++k) {
             const float x  = xp[k];
             const float g  = gp[k];
-            const float dy_k = dy[k];
+            const float dy_k = *(const float *) (dy_row + k*grad->nb[0]);
 
             float act;    // act(x)
             float dact;   // act'(x)

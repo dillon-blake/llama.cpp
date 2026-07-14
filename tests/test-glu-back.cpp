@@ -44,6 +44,57 @@ static double fwd(int op, double x, double g, double alpha, double limit) {
     return act(op, x, alpha, limit) * g;
 }
 
+
+// A TRANSPOSED grad must give the same answer as a contiguous one carrying the same values.
+//
+// ggml's autodiff produces non-contiguous grads routinely (the MUL_MAT backward passes
+// ggml_transpose(grad) straight into ggml_out_prod), and no test-backend-ops case ever builds one --
+// so this bug is invisible to MODE_GRAD by construction. It was found in the S1-26/S1-27 MoE kernels
+// by adversarial review, and GLU_BACK had it too: the same logical grad in two layouts disagreed by
+// 1.30. Read src->nb[0]; never index a float*.
+static int check_transposed_grad(void) {
+    const int NC = 8, NR = 4;
+    float out[2][2*8*4];
+
+    for (int pass = 0; pass < 2; ++pass) {
+        struct ggml_init_params ip = { 16*1024*1024, NULL, false };
+        struct ggml_context * ctx = ggml_init(ip);
+        srand(9);
+
+        struct ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, NC, NR);
+        struct ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, NC, NR);
+        for (int i = 0; i < NC*NR; ++i) {
+            ((float*)a->data)[i] = 2.f*(rand()/(float)RAND_MAX) - 1.f;
+            ((float*)b->data)[i] = 2.f*(rand()/(float)RAND_MAX) - 1.f;
+        }
+        float g[8*4];
+        for (int i = 0; i < NC*NR; ++i) g[i] = 2.f*(rand()/(float)RAND_MAX) - 1.f;
+
+        struct ggml_tensor * dy;
+        if (pass == 0) {
+            dy = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, NC, NR);
+            for (int i = 0; i < NC*NR; ++i) ((float*)dy->data)[i] = g[i];
+        } else {
+            struct ggml_tensor * base = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, NR, NC);
+            for (int r = 0; r < NR; ++r) for (int k = 0; k < NC; ++k) ((float*)base->data)[k*NR+r] = g[r*NC+k];
+            dy = ggml_transpose(ctx, base);   // ne=[NC,NR], nb[0] = NR*4, NOT 4
+        }
+
+        struct ggml_tensor * o = ggml_glu_back(ctx, dy, a, b, GGML_GLU_OP_GEGLU, false, 0.f, 0.f);
+        struct ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, o);
+        ggml_graph_compute_with_ctx(ctx, gf, 2);
+        for (int i = 0; i < 2*NC*NR; ++i) out[pass][i] = ((float*)o->data)[i];
+        ggml_free(ctx);
+    }
+
+    double worst = 0;
+    for (int i = 0; i < 2*NC*NR; ++i) worst = fmax(worst, fabs(out[0][i] - out[1][i]));
+    printf("  %-12s  transposed grad vs contiguous: max diff %.3e   %s\n",
+           "STRIDES", worst, worst == 0.0 ? "identical" : "*** MISREADS A TRANSPOSED GRAD ***");
+    return worst != 0.0;
+}
+
 int main(void) {
     const int ops[] = {GGML_GLU_OP_REGLU, GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU,
                        GGML_GLU_OP_GEGLU_ERF, GGML_GLU_OP_GEGLU_QUICK, GGML_GLU_OP_SWIGLU_OAI};
@@ -104,6 +155,8 @@ int main(void) {
                nm[oi], rx, rg, ok ? "exact" : "*** WRONG ***");
         ggml_free(ctx);
     }
-    printf(bad ? "\n%d VARIANTS WRONG\n" : "\nall six variants match ggml's own forwards\n", bad);
+    bad += check_transposed_grad();
+
+    printf(bad ? "\n%d CHECKS FAILED\n" : "\nall six variants match ggml's own forwards, and strides are honoured\n", bad);
     return bad != 0;
 }

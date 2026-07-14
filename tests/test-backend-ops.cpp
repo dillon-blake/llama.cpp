@@ -336,7 +336,30 @@ static double mean_abs_asymm(const float * a, const float * b, const size_t n, c
             }
         }
 
-        const float asymm = (a[i] - b[i]) / (a[i] + b[i]);
+        // learning-llamas (S1-37): the denominator is |a| + |b|, NOT a + b.
+        //
+        // Two bugs, and they compound.
+        //
+        // 1. Dividing by the SIGNED sum sends the ratio to infinity whenever the two gradients
+        //    nearly cancel -- and in particular whenever the TRUE gradient is near zero and both
+        //    are rounding noise. That is not exotic: any op whose output is a product has such
+        //    elements for ordinary inputs (every GLU: dx = dy * g * act'(x)), and any op that sums
+        //    over a selected subset can manufacture them (MUL_MAT_ID's expert routing). Measured on
+        //    GLU_BACK, with the kernel verified exact against a float64 reference throughout, the
+        //    "noise" reached MAA 1.80 while a genuinely broken kernel measures 0.18-0.60. The noise
+        //    OVERLAPS the defects, and because the metric is unbounded, NO tolerance is safe.
+        //
+        // 2. a == b == 0 gives 0/0 = NaN. `NaN > max_maa_err()` is FALSE, so the case PASSES
+        //    UNCONDITIONALLY. tanh(150) and sigmoid(150) are 1.0 to float precision -- derivative
+        //    exactly zero -- and test_unary initializes in [-150, 150]. TANH and SIGMOID have been
+        //    on the vendor-bump allowlist since S1-19 on the strength of a NaN. So has
+        //    CROSS_ENTROPY_LOSS, whose softmax is one-hot at [-100, 100].
+        //
+        // |a| + |b| >= |a + b| always, so this can only make MAA smaller; it is bounded in [-1, 1],
+        // which is what a symmetric relative error is meant to be. Noise floor on GLU drops from
+        // 1.80 to 0.022, and every injected defect is caught with 3.6-12x margin.
+        const float denom = fabsf(a[i]) + fabsf(b[i]);
+        const float asymm = denom > 0.0f ? (a[i] - b[i]) / denom : 0.0f;
 
         sum += fabsf(asymm);
         nvalid++;
@@ -2098,13 +2121,57 @@ struct test_unary : public test_case {
             max =  10.f;
         }
 
+        // learning-llamas (S1-37): the SATURATING unaries need a conditioned range for MODE_GRAD.
+        //
+        // tanh(150) and sigmoid(150) are 1.0 to float precision, so their derivatives are EXACTLY
+        // zero -- and until the mean_abs_asymm fix, an exactly-zero gradient pair gave 0/0 = NaN,
+        // `NaN > tolerance` is false, and the case passed UNCONDITIONALLY. TANH and SIGMOID have
+        // been on the vendor-bump allowlist since S1-19 on exactly that basis.
+        //
+        // With the metric corrected they are checked for the first time, and at +-150 they fail on
+        // rounding noise in the saturated tails (MAA 0.14 and 0.37) while the kernels are fine: a
+        // grad_eps of 15 against a range of 150 measures nothing a derivative would recognise.
+        //
+        // So MODE_GRAD gets a range where the derivative is not flat, and a step that fits inside
+        // it. The EVAL sweep keeps +-150: it is hunting NaNs in the tails, which is the opposite
+        // requirement.
+        const bool saturating = (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_SIGMOID);
+        if (mode == MODE_GRAD && saturating) {
+            min = -3.0f;
+            max =  3.0f;
+        }
+
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             // test extended range of values to check for NaNs in GELU
             init_tensor_uniform(t, min, max);
         }
     }
 
+    // MEASURED (S1-37). Once the saturating ops are conditioned, the residual is finite-difference
+    // rounding and nothing else:
+    //
+    //   TANH     worst FD noise, 6 runs   5.5e-4
+    //   SIGMOID  worst FD noise, 6 runs   1.1e-2   (sigmoid' peaks at 0.25, so its gradient is
+    //                                               small and the relative metric is harsher)
+    //   a VJP scaled by 2                 0.33     (an identity-scaled error has asymm exactly 1/3)
+    //
+    // These bounds sit above the noise and ~7-600x below a real defect. Before S1-37 these two ops
+    // were passing on a NaN and their gradients were never compared at all.
+    double max_maa_err() override {
+        if (op == GGML_UNARY_OP_SIGMOID) {
+            return 5e-2;
+        }
+        if (op == GGML_UNARY_OP_TANH) {
+            return 5e-3;
+        }
+        return 1e-4;
+    }
+
     float grad_eps() override {
+        // A step of 15 inside a +-3 range would jump clean over the region being measured.
+        if (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_SIGMOID) {
+            return 0.02f;
+        }
         return 15.0f;
     }
 
@@ -2167,33 +2234,32 @@ struct test_glu : public test_case {
     // ggml's own scalar forwards -- exactly, to ~1e-7 -- rather than through this metric. That is
     // the oracle that would catch a wrong coefficient; this one would not.
     double max_maa_err() override {
-        // MODE_GRAD IS A WIRING CHECK FOR THIS OP, NOT A NUMERICS CHECK. Saying so plainly,
-        // because a tolerance this wide would otherwise read as a passing test that means something.
-        //
-        // Measured, with the kernel verified exact (~1e-7) against a float64 reference throughout:
-        //
-        //   FD noise, 12 runs, conditioned init   up to 0.80
-        //   drop act'(x) from dx                       0.52
-        //   drop act(x)  from dg                       0.59
-        //   SWIGLU: drop the x(1-s) term               0.18
-        //
-        // The noise OVERLAPS the defects. No tolerance separates them, so none is chosen: this
-        // bound only asserts the backward builds, schedules, produces the right shapes and does not
-        // abort -- all of which used to be impossible, since REGLU/GEGLU/GEGLU_ERF/GEGLU_QUICK/
-        // SWIGLU_OAI hit GGML_ABORT and fused SwiGLU tripped an assert.
-        //
-        // WHY IT CANNOT BE FIXED HERE. mean_abs_asymm divides by (gn + ga), not (|gn| + |ga|), so a
-        // near-zero gradient element sends the ratio to infinity -- and every GLU gradient is a
-        // PRODUCT (dx = dy * g * act'(x)), so near-zero elements are ordinary, not exotic.
-        // Correcting the metric to |gn| + |ga| drops the noise floor to 0.022 and makes every
-        // defect above catchable with 3.6-12x margin. That change is written and measured, and it
-        // is NOT in this commit: it also removes a NaN-based free pass that TANH, SIGMOID and
-        // CROSS_ENTROPY_LOSS have been relying on since S1-19 (0/0 = NaN, and `NaN > tol` is
-        // false, so they passed unconditionally). Fixing those is its own ticket -- S1-37.
-        //
-        // The NUMERICS are checked by tests/test-glu-back.cpp, which differentiates ggml's own
-        // scalar forwards in float64 and matches all six variants to ~1e-7. That is the oracle.
-        return 0.9;
+        // MEASURED (S1-28 + S1-37), with numbers on both sides:
+    //
+    //   worst FD noise, 15 runs                0.022
+    //   drop act'(x) from dx                   0.52
+    //   drop act(x)  from dg                   0.59
+    //   use act(x) where g belongs in dx       4.51
+    //   GEGLU_QUICK: drop the 2nd deriv term   0.54
+    //   SWIGLU_OAI:  drop the (y+1) factor     0.60
+    //   SWIGLU:      drop the x(1-s) term      0.18
+    //
+    // 5e-2 sits 2.3x above the noise and 3.6-90x below every real defect. Six mutations injected,
+    // six caught.
+    //
+    // This bound was 0.9 -- i.e. meaningless -- until S1-37 fixed mean_abs_asymm to divide by
+    // |gn| + |ga| rather than the signed sum. Before that the "noise" reached 1.80 while a broken
+    // kernel measured 0.18, so the two OVERLAPPED and no bound was safe. Every GLU gradient is a
+    // product (dx = dy * g * act'(x)), so near-zero elements are ordinary, and the old metric sent
+    // the ratio to infinity on every one of them.
+    //
+    // The NUMERICS -- a wrong coefficient rather than a wrong structure -- are still checked by
+    // tests/test-glu-back.cpp, which differentiates ggml's own scalar forwards in float64 and
+    // matches all six variants to ~1e-7. A 5% error in GEGLU's tanh argument is sub-noise here and
+    // fails there instantly.
+    double max_maa_err() override {
+        return 5e-2;
+    }
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -3526,6 +3592,17 @@ struct test_add_id : public test_case {
             int64_t n_token = 10)
         : type_a(type_a), type_b(type_b), n_embd(n_embd),
           n_experts(n_experts), n_experts_used(n_experts_used), n_token(n_token) {}
+
+    // MEASURED. ADD_ID's VJP is the identity, so any disagreement is finite-difference rounding
+    // and nothing else -- but at the default 1e-4 it flaked about 1 run in 10 at MAA 1.2e-4.
+    //
+    //   worst FD noise, 12 runs      1.2e-4
+    //   scale the VJP by 2           0.33      (an identity's asymm under a 2x error is exactly 1/3)
+    //
+    // 1e-3 sits 8x above the noise and 330x below a real defect.
+    double max_maa_err() override {
+        return 1e-3;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, n_embd, n_experts_used, n_token);
@@ -6055,6 +6132,14 @@ struct test_concat : public test_case {
     //
     // A weighted sum, whose weights are not all equal, makes each element of dL/d(out) distinct --
     // so a source that is handed the wrong slab is handed visibly wrong numbers.
+    // MEASURED (S1-37): CONCAT's VJP is a pure routing operation, so any disagreement is
+    // finite-difference rounding -- but it flaked about 1 run in 15 at MAA ~2e-4 against the
+    // default 1e-4. A VJP that dropped or transposed a slab measures order 1. 1e-3 sits 5x above
+    // the noise and ~1000x below a real defect.
+    double max_maa_err() override {
+        return 1e-3;
+    }
+
     ggml_tensor * grad_loss(ggml_context * ctx, ggml_tensor * out) override {
         ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, out->ne);
         ggml_set_name(w, "grad_loss_weights");
@@ -7439,10 +7524,20 @@ struct test_cross_entropy_loss : public test_case {
         return out;
     }
 
+    // MEASURED (S1-37): worst FD noise 3.8e-3 over 6 runs once conditioned; a VJP scaled by 2
+    // measures 0.33. This op was also passing on a NaN before the metric fix -- its softmax is
+    // one-hot at +-100, so most gradient elements were exactly zero.
+    double max_maa_err() override {
+        return 5e-2;
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
         // For larger abs. diffs between logits softmax is more linear, therefore more precise num. gradients.
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            init_tensor_uniform(t, -100.0f, 100.0f);
+            // Same story (S1-37): at +-100 the softmax is one-hot to float precision, so most
+            // gradient elements are EXACTLY zero -- which used to mean NaN and a free pass.
+            const float lim = mode == MODE_GRAD ? 3.0f : 100.0f;
+            init_tensor_uniform(t, -lim, lim);
         }
     }
 
