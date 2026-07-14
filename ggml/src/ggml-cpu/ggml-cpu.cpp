@@ -474,6 +474,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             // and there is no caller for one.
             return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_GLU_BACK:
+            // learning-llamas (S1-28): F32 throughout. The GLU forwards accept F16, but a gradient
+            // is F32 on this project's training path by policy (ADR-0002), and there is no caller
+            // for an F16 variant.
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   (op->src[2] == NULL || op->src[2]->type == GGML_TYPE_F32) &&
+                   op->type == GGML_TYPE_F32;
         case GGML_OP_OUT_PROD_ID:
             // learning-llamas (S1-26): d(b). `as` may be QUANTIZED -- in a LoRA MoE graph the base
             // expert stacks are frozen Q4_K, and the activations flowing into them still carry a

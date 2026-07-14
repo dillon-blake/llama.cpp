@@ -597,6 +597,9 @@ extern "C" {
         GGML_OP_OUT_PROD_ID,
         GGML_OP_OUT_PROD_ID_GRP,
 
+        // learning-llamas: the VJP for every GLU variant ggml could not differentiate (S1-28).
+        GGML_OP_GLU_BACK,
+
         GGML_OP_COUNT,
     };
 
@@ -1337,6 +1340,27 @@ extern "C" {
              struct ggml_tensor * a,
              struct ggml_tensor * b,
              enum ggml_glu_op     op);
+
+    // learning-llamas (S1-28): the VJP of any GLU.
+    //
+    // ggml could differentiate exactly one member of the GLU family -- SPLIT SwiGLU -- via a
+    // SILU_BACK composite. Fused SwiGLU tripped an assert, and REGLU / GEGLU / GEGLU_ERF /
+    // GEGLU_QUICK / SWIGLU_OAI hit `GGML_ABORT("unsupported glu op for backward pass")`. So every
+    // Gemma (GEGLU) and gpt-oss (SWIGLU_OAI) model was untrainable.
+    //
+    // `grad` has the FORWARD'S output shape [nc, ...]. dst always has the FUSED shape [2*nc, ...]:
+    //   - fused input  -> dst IS d_a, both halves, honouring `swapped`
+    //   - split input  -> the caller views half 0 as d_a and half 1 as d_b
+    // One op, one kernel, one row pass, whichever way the caller packed its operands.
+    GGML_API struct ggml_tensor * ggml_glu_back(
+            struct ggml_context * ctx,
+             struct ggml_tensor * grad,
+             struct ggml_tensor * a,
+             struct ggml_tensor * b,      // NULL for the fused form
+             enum ggml_glu_op     op,
+             bool                 swapped,
+             float                alpha,  // SWIGLU_OAI only
+             float                limit); // SWIGLU_OAI only
 
     GGML_API struct ggml_tensor * ggml_reglu_split(
             struct ggml_context * ctx,

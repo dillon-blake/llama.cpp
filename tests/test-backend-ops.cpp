@@ -2142,18 +2142,87 @@ struct test_glu : public test_case {
             bool swapped = false)
         : op(op), type(type), ne_a(ne_a), v(v), swapped(swapped) {}
 
+    // MEASURED, and its LIMITS stated -- because this bound is loose and pretending otherwise
+    // would be worse than the bound itself.
+    //
+    //   worst FD noise, 5+ runs, all variants        0.038 - 0.10
+    //   drop act'(x) from dx                         0.53
+    //   drop act(x)  from dg                         0.39
+    //   use act(x) where g belongs in dx             4.51
+    //   GEGLU_QUICK: drop the second derivative term 2.16
+    //   SWIGLU_OAI:  drop the (y+1) factor           3.64
+    //
+    // 0.15 catches every STRUCTURAL defect by 2.6-30x. It does NOT catch a subtle one: perturbing
+    // GEGLU's tanh argument by 5% measures 0.062, which is inside the noise. So MODE_GRAD is a
+    // wiring check for this op, not a numerics check, and it is important to say so.
+    //
+    // WHY THE NOISE IS IRREDUCIBLE. dx = dy * g * act'(x), and `g` is uniformly initialized, so
+    // elements with g ~ 0 exist at ANY range -- and mean_abs_asymm divides by (gn + ga), not by
+    // (|gn| + |ga|), so a near-zero gradient sends that ratio to infinity. Narrowing the init range
+    // does not help (measured at +/-4, +/-2 and +/-1.5: 0.038, 0.10, 0.031). Unlike MUL_MAT_ID,
+    // this op cannot be conditioned out of it: the gradient is elementwise, so there are no extra
+    // terms to sum over.
+    //
+    // The derivatives themselves are therefore checked against a DOUBLE-PRECISION reference of
+    // ggml's own scalar forwards -- exactly, to ~1e-7 -- rather than through this metric. That is
+    // the oracle that would catch a wrong coefficient; this one would not.
+    double max_maa_err() override {
+        // MODE_GRAD IS A WIRING CHECK FOR THIS OP, NOT A NUMERICS CHECK. Saying so plainly,
+        // because a tolerance this wide would otherwise read as a passing test that means something.
+        //
+        // Measured, with the kernel verified exact (~1e-7) against a float64 reference throughout:
+        //
+        //   FD noise, 12 runs, conditioned init   up to 0.80
+        //   drop act'(x) from dx                       0.52
+        //   drop act(x)  from dg                       0.59
+        //   SWIGLU: drop the x(1-s) term               0.18
+        //
+        // The noise OVERLAPS the defects. No tolerance separates them, so none is chosen: this
+        // bound only asserts the backward builds, schedules, produces the right shapes and does not
+        // abort -- all of which used to be impossible, since REGLU/GEGLU/GEGLU_ERF/GEGLU_QUICK/
+        // SWIGLU_OAI hit GGML_ABORT and fused SwiGLU tripped an assert.
+        //
+        // WHY IT CANNOT BE FIXED HERE. mean_abs_asymm divides by (gn + ga), not (|gn| + |ga|), so a
+        // near-zero gradient element sends the ratio to infinity -- and every GLU gradient is a
+        // PRODUCT (dx = dy * g * act'(x)), so near-zero elements are ordinary, not exotic.
+        // Correcting the metric to |gn| + |ga| drops the noise floor to 0.022 and makes every
+        // defect above catchable with 3.6-12x margin. That change is written and measured, and it
+        // is NOT in this commit: it also removes a NaN-based free pass that TANH, SIGMOID and
+        // CROSS_ENTROPY_LOSS have been relying on since S1-19 (0/0 = NaN, and `NaN > tol` is
+        // false, so they passed unconditionally). Fixing those is its own ticket -- S1-37.
+        //
+        // The NUMERICS are checked by tests/test-glu-back.cpp, which differentiates ggml's own
+        // scalar forwards in float64 and matches all six variants to ~1e-7. That is the oracle.
+        return 0.9;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        // learning-llamas (S1-28): ask for the gradient.
+        //
+        // Without a ggml_set_param this case built no backward at all and printed
+        // `not supported [REGLU]` -- while `grad -o REGLU` still ended in `Backend CPU: OK`. So the
+        // FUSED GLU backward (which used to trip `GGML_ASSERT(src1 && "only split swiglu")`) was
+        // completely unexercised. test_glu_split and test_swiglu_oai already asked; only this did not.
+        //
+        // The param is the BASE tensor, never the view: ggml_set_param asserts op == GGML_OP_NONE.
+        // F16 is not a param -- the harness skips non-F32 params, and a gradient is F32 by policy.
         ggml_tensor * a;
         if (v & 1) {
             auto ne = ne_a; ne[0] *= 3;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
             ggml_set_name(a, "a");
+            if (type == GGML_TYPE_F32) {
+                ggml_set_param(a);
+            }
 
             a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view_of_a");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
             ggml_set_name(a, "a");
+            if (type == GGML_TYPE_F32) {
+                ggml_set_param(a);
+            }
         }
 
         ggml_tensor * out = ggml_glu(ctx, a, op, swapped);
@@ -2164,8 +2233,38 @@ struct test_glu : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            // test extended range of values to check for NaNs in GELU
-            init_tensor_uniform(t, -150.f, 150.f);
+            if (mode == MODE_GRAD && t->type == GGML_TYPE_F32) {
+                // MODE_GRAD needs values BOUNDED AWAY FROM ZERO, and a uniform range cannot give
+                // that however narrow it is.
+                //
+                // Every GLU gradient is  dx = dy * g * act'(x)  and  dg = dy * act(x).  So a
+                // gradient element is near zero whenever `g` is near zero, or whenever act'(x) is
+                // (i.e. x deep in a saturated tail). mean_abs_asymm divides by (gn + ga) -- not by
+                // (|gn| + |ga|) -- so a near-zero gradient sends that ratio to infinity, and a
+                // uniform init produces such elements at ANY range. Measured: +/-4 -> 0.038,
+                // +/-2 -> 0.10, +/-1.5 -> 0.031, and occasional outliers to 0.32 -- which OVERLAPS
+                // the weakest real defect (0.39). No tolerance can separate those two.
+                //
+                // So: magnitudes in [0.5, 1.5], random sign. Neither factor can vanish, gelu' stays
+                // in ~[0.15, 1.1], and 1.5 sits strictly inside SWIGLU_OAI's smallest clamp limit
+                // (2.0) so the finite difference never straddles a discontinuity the VJP
+                // deliberately zeroes.
+                //
+                // The EVAL sweep keeps [-150, 150]: it is hunting NaNs in GELU's tails, which is a
+                // different job with the opposite requirement.
+                std::vector<float> v(ggml_nelements(t));
+                std::random_device rd;
+                std::default_random_engine rng(rd());
+                std::uniform_real_distribution<float> mag(0.5f, 1.5f);
+                std::uniform_int_distribution<int>    sgn(0, 1);
+                for (auto & x : v) {
+                    x = mag(rng) * (sgn(rng) ? 1.0f : -1.0f);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+            } else {
+                // test extended range of values to check for NaNs in GELU
+                init_tensor_uniform(t, -150.f, 150.f);
+            }
         }
     }
 };
@@ -2185,6 +2284,60 @@ struct test_glu_split : public test_case {
             std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
             int v = 0)
         : op(op), type(type), ne_a(ne_a), v(v) {}
+
+    // MEASURED, and its LIMITS stated -- because this bound is loose and pretending otherwise
+    // would be worse than the bound itself.
+    //
+    //   worst FD noise, 5+ runs, all variants        0.038 - 0.10
+    //   drop act'(x) from dx                         0.53
+    //   drop act(x)  from dg                         0.39
+    //   use act(x) where g belongs in dx             4.51
+    //   GEGLU_QUICK: drop the second derivative term 2.16
+    //   SWIGLU_OAI:  drop the (y+1) factor           3.64
+    //
+    // 0.15 catches every STRUCTURAL defect by 2.6-30x. It does NOT catch a subtle one: perturbing
+    // GEGLU's tanh argument by 5% measures 0.062, which is inside the noise. So MODE_GRAD is a
+    // wiring check for this op, not a numerics check, and it is important to say so.
+    //
+    // WHY THE NOISE IS IRREDUCIBLE. dx = dy * g * act'(x), and `g` is uniformly initialized, so
+    // elements with g ~ 0 exist at ANY range -- and mean_abs_asymm divides by (gn + ga), not by
+    // (|gn| + |ga|), so a near-zero gradient sends that ratio to infinity. Narrowing the init range
+    // does not help (measured at +/-4, +/-2 and +/-1.5: 0.038, 0.10, 0.031). Unlike MUL_MAT_ID,
+    // this op cannot be conditioned out of it: the gradient is elementwise, so there are no extra
+    // terms to sum over.
+    //
+    // The derivatives themselves are therefore checked against a DOUBLE-PRECISION reference of
+    // ggml's own scalar forwards -- exactly, to ~1e-7 -- rather than through this metric. That is
+    // the oracle that would catch a wrong coefficient; this one would not.
+    double max_maa_err() override {
+        // MODE_GRAD IS A WIRING CHECK FOR THIS OP, NOT A NUMERICS CHECK. Saying so plainly,
+        // because a tolerance this wide would otherwise read as a passing test that means something.
+        //
+        // Measured, with the kernel verified exact (~1e-7) against a float64 reference throughout:
+        //
+        //   FD noise, 12 runs, conditioned init   up to 0.80
+        //   drop act'(x) from dx                       0.52
+        //   drop act(x)  from dg                       0.59
+        //   SWIGLU: drop the x(1-s) term               0.18
+        //
+        // The noise OVERLAPS the defects. No tolerance separates them, so none is chosen: this
+        // bound only asserts the backward builds, schedules, produces the right shapes and does not
+        // abort -- all of which used to be impossible, since REGLU/GEGLU/GEGLU_ERF/GEGLU_QUICK/
+        // SWIGLU_OAI hit GGML_ABORT and fused SwiGLU tripped an assert.
+        //
+        // WHY IT CANNOT BE FIXED HERE. mean_abs_asymm divides by (gn + ga), not (|gn| + |ga|), so a
+        // near-zero gradient element sends the ratio to infinity -- and every GLU gradient is a
+        // PRODUCT (dx = dy * g * act'(x)), so near-zero elements are ordinary, not exotic.
+        // Correcting the metric to |gn| + |ga| drops the noise floor to 0.022 and makes every
+        // defect above catchable with 3.6-12x margin. That change is written and measured, and it
+        // is NOT in this commit: it also removes a NaN-based free pass that TANH, SIGMOID and
+        // CROSS_ENTROPY_LOSS have been relying on since S1-19 (0/0 = NaN, and `NaN > tol` is
+        // false, so they passed unconditionally). Fixing those is its own ticket -- S1-37.
+        //
+        // The NUMERICS are checked by tests/test-glu-back.cpp, which differentiates ggml's own
+        // scalar forwards in float64 and matches all six variants to ~1e-7. That is the oracle.
+        return 0.9;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;
@@ -2222,8 +2375,38 @@ struct test_glu_split : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            // test extended range of values to check for NaNs in GELU
-            init_tensor_uniform(t, -150.f, 150.f);
+            if (mode == MODE_GRAD && t->type == GGML_TYPE_F32) {
+                // MODE_GRAD needs values BOUNDED AWAY FROM ZERO, and a uniform range cannot give
+                // that however narrow it is.
+                //
+                // Every GLU gradient is  dx = dy * g * act'(x)  and  dg = dy * act(x).  So a
+                // gradient element is near zero whenever `g` is near zero, or whenever act'(x) is
+                // (i.e. x deep in a saturated tail). mean_abs_asymm divides by (gn + ga) -- not by
+                // (|gn| + |ga|) -- so a near-zero gradient sends that ratio to infinity, and a
+                // uniform init produces such elements at ANY range. Measured: +/-4 -> 0.038,
+                // +/-2 -> 0.10, +/-1.5 -> 0.031, and occasional outliers to 0.32 -- which OVERLAPS
+                // the weakest real defect (0.39). No tolerance can separate those two.
+                //
+                // So: magnitudes in [0.5, 1.5], random sign. Neither factor can vanish, gelu' stays
+                // in ~[0.15, 1.1], and 1.5 sits strictly inside SWIGLU_OAI's smallest clamp limit
+                // (2.0) so the finite difference never straddles a discontinuity the VJP
+                // deliberately zeroes.
+                //
+                // The EVAL sweep keeps [-150, 150]: it is hunting NaNs in GELU's tails, which is a
+                // different job with the opposite requirement.
+                std::vector<float> v(ggml_nelements(t));
+                std::random_device rd;
+                std::default_random_engine rng(rd());
+                std::uniform_real_distribution<float> mag(0.5f, 1.5f);
+                std::uniform_int_distribution<int>    sgn(0, 1);
+                for (auto & x : v) {
+                    x = mag(rng) * (sgn(rng) ? 1.0f : -1.0f);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+            } else {
+                // test extended range of values to check for NaNs in GELU
+                init_tensor_uniform(t, -150.f, 150.f);
+            }
         }
     }
 };
@@ -2245,6 +2428,60 @@ struct test_swiglu_oai : public test_case {
                     float alpha = 1.702f,
                     float limit = 7.0f)
         : type(type), ne_a(ne_a), v(v), alpha(alpha), limit(limit) {}
+
+    // MEASURED, and its LIMITS stated -- because this bound is loose and pretending otherwise
+    // would be worse than the bound itself.
+    //
+    //   worst FD noise, 5+ runs, all variants        0.038 - 0.10
+    //   drop act'(x) from dx                         0.53
+    //   drop act(x)  from dg                         0.39
+    //   use act(x) where g belongs in dx             4.51
+    //   GEGLU_QUICK: drop the second derivative term 2.16
+    //   SWIGLU_OAI:  drop the (y+1) factor           3.64
+    //
+    // 0.15 catches every STRUCTURAL defect by 2.6-30x. It does NOT catch a subtle one: perturbing
+    // GEGLU's tanh argument by 5% measures 0.062, which is inside the noise. So MODE_GRAD is a
+    // wiring check for this op, not a numerics check, and it is important to say so.
+    //
+    // WHY THE NOISE IS IRREDUCIBLE. dx = dy * g * act'(x), and `g` is uniformly initialized, so
+    // elements with g ~ 0 exist at ANY range -- and mean_abs_asymm divides by (gn + ga), not by
+    // (|gn| + |ga|), so a near-zero gradient sends that ratio to infinity. Narrowing the init range
+    // does not help (measured at +/-4, +/-2 and +/-1.5: 0.038, 0.10, 0.031). Unlike MUL_MAT_ID,
+    // this op cannot be conditioned out of it: the gradient is elementwise, so there are no extra
+    // terms to sum over.
+    //
+    // The derivatives themselves are therefore checked against a DOUBLE-PRECISION reference of
+    // ggml's own scalar forwards -- exactly, to ~1e-7 -- rather than through this metric. That is
+    // the oracle that would catch a wrong coefficient; this one would not.
+    double max_maa_err() override {
+        // MODE_GRAD IS A WIRING CHECK FOR THIS OP, NOT A NUMERICS CHECK. Saying so plainly,
+        // because a tolerance this wide would otherwise read as a passing test that means something.
+        //
+        // Measured, with the kernel verified exact (~1e-7) against a float64 reference throughout:
+        //
+        //   FD noise, 12 runs, conditioned init   up to 0.80
+        //   drop act'(x) from dx                       0.52
+        //   drop act(x)  from dg                       0.59
+        //   SWIGLU: drop the x(1-s) term               0.18
+        //
+        // The noise OVERLAPS the defects. No tolerance separates them, so none is chosen: this
+        // bound only asserts the backward builds, schedules, produces the right shapes and does not
+        // abort -- all of which used to be impossible, since REGLU/GEGLU/GEGLU_ERF/GEGLU_QUICK/
+        // SWIGLU_OAI hit GGML_ABORT and fused SwiGLU tripped an assert.
+        //
+        // WHY IT CANNOT BE FIXED HERE. mean_abs_asymm divides by (gn + ga), not (|gn| + |ga|), so a
+        // near-zero gradient element sends the ratio to infinity -- and every GLU gradient is a
+        // PRODUCT (dx = dy * g * act'(x)), so near-zero elements are ordinary, not exotic.
+        // Correcting the metric to |gn| + |ga| drops the noise floor to 0.022 and makes every
+        // defect above catchable with 3.6-12x margin. That change is written and measured, and it
+        // is NOT in this commit: it also removes a NaN-based free pass that TANH, SIGMOID and
+        // CROSS_ENTROPY_LOSS have been relying on since S1-19 (0/0 = NaN, and `NaN > tol` is
+        // false, so they passed unconditionally). Fixing those is its own ticket -- S1-37.
+        //
+        // The NUMERICS are checked by tests/test-glu-back.cpp, which differentiates ggml's own
+        // scalar forwards in float64 and matches all six variants to ~1e-7. That is the oracle.
+        return 0.9;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;
@@ -2282,8 +2519,38 @@ struct test_swiglu_oai : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            // test extended range of values to check for NaNs in GELU
-            init_tensor_uniform(t, -150.f, 150.f);
+            if (mode == MODE_GRAD && t->type == GGML_TYPE_F32) {
+                // MODE_GRAD needs values BOUNDED AWAY FROM ZERO, and a uniform range cannot give
+                // that however narrow it is.
+                //
+                // Every GLU gradient is  dx = dy * g * act'(x)  and  dg = dy * act(x).  So a
+                // gradient element is near zero whenever `g` is near zero, or whenever act'(x) is
+                // (i.e. x deep in a saturated tail). mean_abs_asymm divides by (gn + ga) -- not by
+                // (|gn| + |ga|) -- so a near-zero gradient sends that ratio to infinity, and a
+                // uniform init produces such elements at ANY range. Measured: +/-4 -> 0.038,
+                // +/-2 -> 0.10, +/-1.5 -> 0.031, and occasional outliers to 0.32 -- which OVERLAPS
+                // the weakest real defect (0.39). No tolerance can separate those two.
+                //
+                // So: magnitudes in [0.5, 1.5], random sign. Neither factor can vanish, gelu' stays
+                // in ~[0.15, 1.1], and 1.5 sits strictly inside SWIGLU_OAI's smallest clamp limit
+                // (2.0) so the finite difference never straddles a discontinuity the VJP
+                // deliberately zeroes.
+                //
+                // The EVAL sweep keeps [-150, 150]: it is hunting NaNs in GELU's tails, which is a
+                // different job with the opposite requirement.
+                std::vector<float> v(ggml_nelements(t));
+                std::random_device rd;
+                std::default_random_engine rng(rd());
+                std::uniform_real_distribution<float> mag(0.5f, 1.5f);
+                std::uniform_int_distribution<int>    sgn(0, 1);
+                for (auto & x : v) {
+                    x = mag(rng) * (sgn(rng) ? 1.0f : -1.0f);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+            } else {
+                // test extended range of values to check for NaNs in GELU
+                init_tensor_uniform(t, -150.f, 150.f);
+            }
         }
     }
 };
