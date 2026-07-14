@@ -600,6 +600,10 @@ extern "C" {
         // learning-llamas: the VJP for every GLU variant ggml could not differentiate (S1-28).
         GGML_OP_GLU_BACK,
 
+        // learning-llamas: the state-space VJPs (S1-29b wiring, S1-30/S1-31 kernels).
+        GGML_OP_SSM_CONV_BACK,
+        GGML_OP_SSM_SCAN_BACK,
+
         GGML_OP_COUNT,
     };
 
@@ -2512,8 +2516,50 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // learning-llamas (S1-29b): d(sx) for ggml_ssm_conv.
+    //
+    // The forward is a depthwise causal convolution:
+    //
+    //     y[i1, t, i3] = sum_{i0 < d_conv}  sx[t + i0, i1, i3] * c[i0, i1]
+    //
+    // so the gradient w.r.t. the input window is the same convolution run backwards:
+    //
+    //     d_sx[j, i1, i3] = sum_{t : 0 <= j - t < d_conv, 0 <= t < n_t}  dy[i1, t, i3] * c[j - t, i1]
+    //
+    // dst has sx's shape. The conv weight `c` is a frozen base weight on this project's LoRA path
+    // and takes no gradient (ROADMAP E8); the backward case asserts rather than silently skipping.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * dy,   // [d_inner, n_t, n_s]
+            struct ggml_tensor  * sx,   // for the output shape
+            struct ggml_tensor  * c);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * A,
+            struct ggml_tensor  * B,
+            struct ggml_tensor  * C,
+            struct ggml_tensor  * ids);
+
+    // learning-llamas (S1-29b): the VJP of the selective scan.
+    //
+    // ggml_ssm_scan returns a PACKED 1-D dst -- `y` concatenated with the final states -- and so
+    // does this: one op cannot return five tensors, so the backward packs
+    //
+    //     [ d_s | d_x | d_dt | d_B | d_C ]
+    //
+    // and the backward case views each region back onto its source. `grad` is the WHOLE packed
+    // gradient of the forward's dst, state region included: MODE_GRAD's objective sums over it, so
+    // it is NOT zero there, and a kernel that assumed otherwise would disagree with the finite
+    // difference and be wrong to. The state-grad region seeds the reverse recurrence at t = n_t.
+    //
+    // A (the decay matrix) and ids (I32) take no gradient here.
+    GGML_API struct ggml_tensor * ggml_ssm_scan_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad,  // the packed gradient of ssm_scan's dst
             struct ggml_tensor  * s,
             struct ggml_tensor  * x,
             struct ggml_tensor  * dt,

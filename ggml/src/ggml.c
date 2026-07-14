@@ -1102,9 +1102,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OUT_PROD_ID_GRP",
 
     "GLU_BACK",
+
+    "SSM_CONV_BACK",
+    "SSM_SCAN_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1221,9 +1224,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "out_prod_id_grp(b,grad,ids)",
 
     "glu_back(grad,a,b)",
+
+    "ssm_conv_back(dy,sx,c)",
+    "ssm_scan_back(grad,...)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5807,6 +5813,83 @@ struct ggml_tensor * ggml_ssm_scan(
     return result;
 }
 
+// ggml_ssm_conv_back / ggml_ssm_scan_back  (learning-llamas, S1-29b)
+
+struct ggml_tensor * ggml_ssm_conv_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * dy,
+        struct ggml_tensor  * sx,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(ggml_is_3d(sx));
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(dy->type == GGML_TYPE_F32);
+    GGML_ASSERT(sx->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type  == GGML_TYPE_F32);
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = sx->ne[0] - d_conv + 1;
+    const int64_t n_s     = sx->ne[2];
+
+    GGML_ASSERT(sx->ne[1] == d_inner);
+    GGML_ASSERT(dy->ne[0] == d_inner);
+    GGML_ASSERT(dy->ne[1] == n_t);
+    GGML_ASSERT(dy->ne[2] == n_s);
+
+    // d_sx has sx's shape, including the d_conv - 1 columns of leading state: those receive a
+    // gradient too (they are part of the convolution window), and dropping them would silently
+    // truncate the gradient at every sequence boundary.
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, sx->ne[0], sx->ne[1], sx->ne[2]);
+
+    result->op     = GGML_OP_SSM_CONV_BACK;
+    result->src[0] = dy;
+    result->src[1] = sx;
+    result->src[2] = c;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_ssm_scan_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * dt,
+        struct ggml_tensor  * A,
+        struct ggml_tensor  * B,
+        struct ggml_tensor  * C,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type  == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_are_same_shape(B, C));
+
+    // grad is the gradient of ssm_scan's PACKED dst: y, then the final states.
+    GGML_ASSERT(ggml_nelements(grad) ==
+        ggml_nelements(x) + s->ne[0]*s->ne[1]*s->ne[2]*ids->ne[0]);
+
+    // One op, five gradients. Packed in a fixed order, and the backward case views each region
+    // back onto its source -- the same trick ggml_ssm_scan itself uses for y + states.
+    const int64_t n_packed = ggml_nelements(s)
+                           + ggml_nelements(x)
+                           + ggml_nelements(dt)
+                           + ggml_nelements(B)
+                           + ggml_nelements(C);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_packed);
+
+    result->op     = GGML_OP_SSM_SCAN_BACK;
+    result->src[0] = grad;
+    result->src[1] = s;
+    result->src[2] = x;
+    result->src[3] = dt;
+    result->src[4] = A;
+    result->src[5] = B;
+    result->src[6] = C;
+    result->src[7] = ids;
+
+    return result;
+}
+
 // ggml_win_part
 
 struct ggml_tensor * ggml_win_part(
@@ -7338,6 +7421,91 @@ static void ggml_compute_backward(
             } else {
                 // Fused: dst IS d_a, both halves, in src0's own layout.
                 ggml_add_or_set(ctx, cgraph, isrc0, gb);
+            }
+        } break;
+        case GGML_OP_SSM_CONV: {
+            // learning-llamas (S1-29b). src0 = sx (the padded input window), src1 = c (the conv
+            // weight). Only sx takes a gradient: c is a frozen base weight on the LoRA path, and
+            // training it is ROADMAP E8.
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_ssm_conv_back(ctx, grad, src0, src1));
+            }
+            GGML_ASSERT(!src1_needs_grads && "SSM conv-weight gradients are not implemented (ROADMAP E8)");
+        } break;
+        case GGML_OP_SSM_SCAN: {
+            // learning-llamas (S1-29b). Seven sources: s, x, dt, A, B, C, ids.
+            //
+            // Five of them take a gradient, and one op cannot return five tensors -- so
+            // ggml_ssm_scan_back returns a PACKED 1-D tensor, exactly as ggml_ssm_scan itself packs
+            // y with the final states, and each region is viewed back onto its source here.
+            //
+            // A (the decay matrix) and ids (I32) do not. A is a frozen base weight on the LoRA
+            // path; asserting is better than silently producing nothing, because "the model trained
+            // but A never moved" is not a thing anyone would notice.
+            struct ggml_tensor * ssm_s  = tensor->src[0];
+            struct ggml_tensor * ssm_x  = tensor->src[1];
+            struct ggml_tensor * ssm_dt = tensor->src[2];
+            struct ggml_tensor * ssm_A  = tensor->src[3];
+            struct ggml_tensor * ssm_B  = tensor->src[4];
+            struct ggml_tensor * ssm_C  = tensor->src[5];
+            struct ggml_tensor * ssm_id = tensor->src[6];
+
+            const size_t issm_s  = ggml_hash_find(hash_set, ssm_s);
+            const size_t issm_x  = ggml_hash_find(hash_set, ssm_x);
+            const size_t issm_dt = ggml_hash_find(hash_set, ssm_dt);
+            const size_t issm_A  = ggml_hash_find(hash_set, ssm_A);
+            const size_t issm_B  = ggml_hash_find(hash_set, ssm_B);
+            const size_t issm_C  = ggml_hash_find(hash_set, ssm_C);
+
+            const bool need_s  = issm_s  != GGML_HASHSET_FULL && grads_needed[issm_s];
+            const bool need_x  = issm_x  != GGML_HASHSET_FULL && grads_needed[issm_x];
+            const bool need_dt = issm_dt != GGML_HASHSET_FULL && grads_needed[issm_dt];
+            const bool need_A  = issm_A  != GGML_HASHSET_FULL && grads_needed[issm_A];
+            const bool need_B  = issm_B  != GGML_HASHSET_FULL && grads_needed[issm_B];
+            const bool need_C  = issm_C  != GGML_HASHSET_FULL && grads_needed[issm_C];
+
+            GGML_ASSERT(!need_A && "SSM A-matrix gradients are not implemented (ROADMAP E8)");
+
+            if (need_s || need_x || need_dt || need_B || need_C) {
+                struct ggml_tensor * gb = ggml_ssm_scan_back(
+                        ctx, grad, ssm_s, ssm_x, ssm_dt, ssm_A, ssm_B, ssm_C, ssm_id);
+
+                // Packed in this order: d_s | d_x | d_dt | d_B | d_C.
+                size_t off = 0;
+
+                if (need_s) {
+                    ggml_add_or_set(ctx, cgraph, issm_s,
+                        ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_view_1d(ctx, gb, ggml_nelements(ssm_s), off)),
+                                        ssm_s->ne[0], ssm_s->ne[1], ssm_s->ne[2], ssm_s->ne[3]));
+                }
+                off += ggml_nelements(ssm_s)*sizeof(float);
+
+                if (need_x) {
+                    ggml_add_or_set(ctx, cgraph, issm_x,
+                        ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_view_1d(ctx, gb, ggml_nelements(ssm_x), off)),
+                                        ssm_x->ne[0], ssm_x->ne[1], ssm_x->ne[2], ssm_x->ne[3]));
+                }
+                off += ggml_nelements(ssm_x)*sizeof(float);
+
+                if (need_dt) {
+                    ggml_add_or_set(ctx, cgraph, issm_dt,
+                        ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_view_1d(ctx, gb, ggml_nelements(ssm_dt), off)),
+                                        ssm_dt->ne[0], ssm_dt->ne[1], ssm_dt->ne[2], ssm_dt->ne[3]));
+                }
+                off += ggml_nelements(ssm_dt)*sizeof(float);
+
+                if (need_B) {
+                    ggml_add_or_set(ctx, cgraph, issm_B,
+                        ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_view_1d(ctx, gb, ggml_nelements(ssm_B), off)),
+                                        ssm_B->ne[0], ssm_B->ne[1], ssm_B->ne[2], ssm_B->ne[3]));
+                }
+                off += ggml_nelements(ssm_B)*sizeof(float);
+
+                if (need_C) {
+                    ggml_add_or_set(ctx, cgraph, issm_C,
+                        ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_view_1d(ctx, gb, ggml_nelements(ssm_C), off)),
+                                        ssm_C->ne[0], ssm_C->ne[1], ssm_C->ne[2], ssm_C->ne[3]));
+                }
             }
         } break;
         case GGML_OP_NONE: {
