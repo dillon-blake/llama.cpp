@@ -2233,8 +2233,7 @@ struct test_glu : public test_case {
     // The derivatives themselves are therefore checked against a DOUBLE-PRECISION reference of
     // ggml's own scalar forwards -- exactly, to ~1e-7 -- rather than through this metric. That is
     // the oracle that would catch a wrong coefficient; this one would not.
-    double max_maa_err() override {
-        // MEASURED (S1-28 + S1-37), with numbers on both sides:
+    // MEASURED (S1-28 + S1-37), with numbers on both sides:
     //
     //   worst FD noise, 15 runs                0.022
     //   drop act'(x) from dx                   0.52
@@ -2259,7 +2258,6 @@ struct test_glu : public test_case {
     // fails there instantly.
     double max_maa_err() override {
         return 5e-2;
-    }
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -2705,7 +2703,14 @@ struct test_get_rows_back : public test_case {
             ggml_set_name(rows, "view_of_rows");
         }
 
-        ggml_tensor * grad = ggml_new_tensor_3d(ctx, type, n, r, b);
+        // learning-llamas (S1-28): grad must have the shape get_rows would have PRODUCED for these
+        // rows -- i.e. the VIEWED row count when v is set, not the underlying one.
+        //
+        // It used to be built as [n, r, b] regardless, which is inconsistent with a [r/2, b] index
+        // tensor. That only "worked" because the old kernel indexed grad FLAT by the running row
+        // counter and ignored the structure entirely -- an accident that also meant it could not
+        // support the 3D get_rows that build_moe_ffn actually performs.
+        ggml_tensor * grad = ggml_new_tensor_3d(ctx, type, n, rows->ne[0], b);
         ggml_set_name(grad, "grad");
 
         ggml_tensor * out = ggml_get_rows_back(ctx, grad, rows, in_forward);
@@ -3519,8 +3524,22 @@ struct test_bin_bcast : public test_case {
             ggml_set_name(b[i], (std::string("b") + std::to_string(i)).c_str());
         }
 
-        // The backward pass supports broadcasting only for GGML_ADD:
-        const bool grad_supported = op == ggml_add && ggml_are_same_shape(a, b[0]) && nf == 1 && !perm1;
+        // learning-llamas (S1-28): ADD, MUL and DIV all reduce a broadcast src1 gradient now.
+        //
+        // This used to read `op == ggml_add && ggml_are_same_shape(a, b[0])`, with the comment
+        // "the backward pass supports broadcasting only for GGML_ADD". Two consequences:
+        //
+        //   - MUL and DIV were never grad-tested at all, at any shape.
+        //   - NO broadcasting case was ever grad-tested, for any op -- the same-shape clause
+        //     excluded them.
+        //
+        // So DIV's backward, which did NOT reduce over the broadcast axis (MUL's always has), was
+        // structurally invisible. It aborts ggml_build_backward_expand's own same-shape assert the
+        // moment a gradient reaches it -- and build_moe_ffn normalizes its router weights with
+        // exactly `div(weights[n_used, n_tok], sum_rows(weights)[1, n_tok])`, so no MoE model could
+        // train. Found by training one; it could not have been found here.
+        const bool grad_supported = (op == ggml_add || op == ggml_mul || op == ggml_div) &&
+                                    nf == 1 && !perm1 && !src_overlap;
         if (grad_supported) {
             ggml_set_param(a);
             ggml_set_param(b[0]);
@@ -3562,7 +3581,25 @@ struct test_bin_bcast : public test_case {
         return op == ggml_div;
     }
 
+    // MEASURED (S1-28). Note grad_eps, grad_precise and this bound ALL branch on the op already --
+    // upstream tuned this class for MUL and DIV gradients and then never enabled them, because the
+    // `grad_supported` gate in build_graph admitted only same-shape ADD. All of that tuning was
+    // dead code, and DIV's broadcast backward bug lived behind it.
+    //
+    //   worst FD noise over the DIV sweep, broadcast included   1.6e-3
+    //   ADD, MUL                                                inside 1e-4
+    //
+    // DIV's gradient w.r.t. the denominator is -a/b^2 -- SECOND order in b -- so its finite
+    // difference is intrinsically noisier than ADD's (constant) or MUL's (first order); hence the
+    // looser bound and grad_precise() above.
+    //
+    // The missing repeat_back itself does not show up as a large MAA at all: it aborts
+    // ggml_build_backward_expand's own same-shape assert. The guards for that are the abort, and
+    // tests/test_moe.py -- which trains a model whose router normalization IS a broadcast DIV.
     double max_maa_err() override {
+        if (op == ggml_div) {
+            return 5e-3;
+        }
         return op == ggml_add ? 1e-4 : 1e-3;
     }
 };

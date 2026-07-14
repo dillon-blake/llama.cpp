@@ -5606,19 +5606,38 @@ static void ggml_compute_forward_get_rows_back_f32(
 
     memset(dst->data, 0, ggml_nbytes(dst));
 
-    const int nc = src0->ne[0];
-    const int nr = ggml_nelements(src1);
+    const int64_t nc = src0->ne[0];
 
     GGML_ASSERT( dst->ne[0] == nc);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
 
-    for (int i = 0; i < nr; ++i) {
-        const int r = ((int32_t *) src1->data)[i];
+    // learning-llamas (S1-28): the general form, matching ggml_get_rows' own semantics
+    //
+    //     out[i0, i10, i11, i12] = a[i0, b[i10,i11,i12], i11, i12]
+    //
+    // so the gradient scatter-adds back along the gathered axis:
+    //
+    //     d_a[i0, b[i10,i11,i12], i11, i12] += grad[i0, i10, i11, i12]
+    //
+    // This used to be written for a 1-D index tensor only, which meant a 3D get_rows had a forward
+    // and no backward -- and build_moe_ffn's router-weight gather is exactly a 3D get_rows, so no
+    // MoE model could train. The old 2-D loop is the i11 == i12 == 0 slice of this one.
+    for (int64_t i12 = 0; i12 < src1->ne[2]; ++i12) {
+        for (int64_t i11 = 0; i11 < src1->ne[1]; ++i11) {
+            for (int64_t i10 = 0; i10 < src1->ne[0]; ++i10) {
+                const int64_t r = *(const int32_t *) ((const char *) src1->data
+                                    + i10*src1->nb[0] + i11*src1->nb[1] + i12*src1->nb[2]);
 
-        ggml_vec_add_f32(nc,
-                (float *) ((char *)  dst->data + r*dst->nb[1]),
-                (float *) ((char *)  dst->data + r*dst->nb[1]),
-                (float *) ((char *) src0->data + i*src0->nb[1]));
+                GGML_ASSERT(r >= 0 && r < dst->ne[1]);
+
+                float * d = (float *) ((char *) dst->data
+                                + r*dst->nb[1] + i11*dst->nb[2] + i12*dst->nb[3]);
+                const float * g = (const float *) ((const char *) src0->data
+                                + i10*src0->nb[1] + i11*src0->nb[2] + i12*src0->nb[3]);
+
+                ggml_vec_add_f32(nc, d, d, g);
+            }
+        }
     }
 }
 

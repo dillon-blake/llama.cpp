@@ -4054,12 +4054,31 @@ struct ggml_tensor * ggml_get_rows_back(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         struct ggml_tensor  * c) {
-    GGML_ASSERT(ggml_is_matrix(a) && ggml_is_vector(b) && b->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_matrix(c) && (a->ne[0] == c->ne[0]));
+    // learning-llamas (S1-28): this used to require a MATRIX grad and a VECTOR index tensor --
+    //
+    //     GGML_ASSERT(ggml_is_matrix(a) && ggml_is_vector(b) && ...)
+    //
+    // -- while ggml_get_rows itself has always been fully general:
+    //
+    //     out[i0, i10, i11, i12] = a[i0, b[i10,i11,i12], i11, i12]
+    //
+    // So any get_rows with a 3D source and a 2D index tensor had a FORWARD but no backward, and
+    // aborted here. build_moe_ffn does exactly that -- it gathers each token's top-k router
+    // probabilities with
+    //
+    //     weights = get_rows(probs[1, n_expert, n_tok], selected_experts[n_used, n_tok])
+    //
+    // -- so no MoE model could train, whatever else was implemented. The assert fires in the graph
+    // BUILD, so it is a hard abort with no hint about the router.
+    //
+    // The gradient is a scatter-add back onto the gathered axis, and it is the same operation
+    // whatever the rank. dst takes c's shape, which is what the 2D case already produced.
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
+    GGML_ASSERT(a->ne[0] == c->ne[0]);
+    GGML_ASSERT(ggml_nelements(b) == a->ne[1]*a->ne[2]*a->ne[3]);
 
     // TODO: implement non F32 return
-    //struct ggml_tensor * result = ggml_new_tensor_2d(ctx, a->type, a->ne[0], b->ne[0]);
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1]);
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1], c->ne[2], c->ne[3]);
 
     result->op     = GGML_OP_GET_ROWS_BACK;
     result->src[0] = a;
@@ -6743,7 +6762,26 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, grad, src1));
             }
             if (src1_needs_grads) {
-                ggml_sub_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1)));
+                // learning-llamas (S1-28): DIV's backward did not handle a BROADCAST src1, while
+                // MUL's -- six lines above -- always has.
+                //
+                // d/d(b) of (a/b) is -a/b^2 = -(a/b)/b, which has a's shape. When b is broadcast
+                // against a, that gradient has to be REDUCED back onto b's shape, exactly as MUL
+                // does. Without it the backward builder aborts on its own same-shape assert.
+                //
+                // This is not a corner case. build_moe_ffn normalizes the top-k router weights with
+                //
+                //     weights = div(weights, sum_rows(weights))     // [n_used, n_tok] / [1, n_tok]
+                //
+                // so EVERY MoE model with norm_w set -- which is every Mixtral -- hits it the moment
+                // a gradient reaches the router path. It is why no MoE could train even after
+                // MUL_MAT_ID had a backward, and it is invisible to test-backend-ops because
+                // test_bin_bcast never asks for a gradient.
+                struct ggml_tensor * tmp = ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1));
+                if (!ggml_are_same_shape(src0, src1)) {
+                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                }
+                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case GGML_OP_SQR: {
