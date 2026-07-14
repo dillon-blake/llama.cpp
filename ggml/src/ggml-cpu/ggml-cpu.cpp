@@ -475,9 +475,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;
         case GGML_OP_SSM_CONV_BACK:
+            // learning-llamas (S1-30): d(sx) for the depthwise causal convolution. F32 throughout --
+            // the conv weight is F32 in every Mamba GGUF, and a gradient is F32 by policy.
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_SSM_SCAN_BACK:
-            // learning-llamas (S1-29b): declared, not yet implemented. The kernels land in S1-30
-            // and S1-31, which flip this to a real check.
+            // learning-llamas (S1-29b): declared, not yet implemented. The kernel lands in S1-31,
+            // which flips this to a real check.
             //
             // This case is NOT redundant. The default below returns TRUE, so a new op with no
             // dispatch case is reported *supported* by the CPU backend, gets scheduled, and then

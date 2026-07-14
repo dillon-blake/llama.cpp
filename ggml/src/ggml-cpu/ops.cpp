@@ -9946,6 +9946,90 @@ void ggml_compute_forward_flash_attn_back(
 
 // ggml_compute_forward_ssm_conv
 
+// ggml_compute_forward_ssm_conv_back  (learning-llamas, S1-30)
+//
+// The forward is a depthwise causal convolution over a sliding window:
+//
+//     y[i1, i2, i3] = sum_{i0 < d_conv}  sx[i2 + i0, i1, i3] * c[i0, i1]
+//
+// so the gradient w.r.t. the window SCATTERS each output's gradient back across the d_conv inputs
+// that produced it:
+//
+//     d_sx[i2 + i0, i1, i3] += dy[i1, i2, i3] * c[i0, i1]
+//
+// Written as a scatter rather than the equivalent gather (`d_sx[j] = sum over t of dy[t]*c[j-t]`,
+// with its two-sided bounds on t) because the scatter needs no boundary arithmetic at all: every
+// (i2, i0) pair lands in range by construction. The leading d_conv - 1 columns of sx are the
+// carried convolution state, and they receive a gradient like any other input -- dropping them
+// would silently truncate the gradient at every sequence boundary.
+//
+// Threaded by (row, sequence): each (i1, i3) owns its own d_sx column, so there are no atomics, no
+// barrier, and the accumulation order within a column is fixed by the i2/i0 loops rather than by
+// thread arrival. Deterministic by construction (ADR-0002).
+static void ggml_compute_forward_ssm_conv_back_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];  // dy [d_inner, n_t, n_s]
+    const ggml_tensor * src1 = dst->src[1];  // sx -- shape only
+    const ggml_tensor * src2 = dst->src[2];  // c  [d_conv, d_inner]
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+    GGML_ASSERT(src2->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nc      = src2->ne[0];   // d_conv
+    const int64_t ncs     = src1->ne[0];   // d_conv - 1 + n_t
+    const int64_t d_inner = src1->ne[1];
+    const int64_t n_t     = src0->ne[1];
+    const int64_t n_s     = src1->ne[2];
+
+    GGML_ASSERT(dst->ne[0] == ncs);
+    GGML_ASSERT(dst->ne[1] == d_inner);
+    GGML_ASSERT(dst->ne[2] == n_s);
+    GGML_ASSERT(src0->ne[0] == d_inner);
+    GGML_ASSERT(src0->ne[2] == n_s);
+    GGML_ASSERT(src2->ne[1] == d_inner);
+    GGML_ASSERT(ncs == nc - 1 + n_t);
+
+    // rows per thread, over d_inner
+    const int64_t dr  = (d_inner + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, d_inner);
+
+    for (int64_t i3 = 0; i3 < n_s; ++i3) {
+        for (int64_t i1 = ir0; i1 < ir1; ++i1) {
+            float * d = (float *) ((char *) dst->data + i1*dst->nb[1] + i3*dst->nb[2]);
+
+            // Zeroed here, not by a memset over the whole tensor: each thread owns exactly the
+            // columns it is about to write, so no barrier is needed between the clear and the
+            // accumulate.
+            ggml_vec_set_f32(ncs, d, 0.0f);
+
+            const float * c = (const float *) ((const char *) src2->data + i1*src2->nb[1]);
+
+            for (int64_t i2 = 0; i2 < n_t; ++i2) {
+                const float g = *(const float *) ((const char *) src0->data
+                                    + i1*src0->nb[0] + i2*src0->nb[1] + i3*src0->nb[2]);
+
+                // d[i2 .. i2 + nc) += g * c[0 .. nc)
+                ggml_vec_mad_f32(nc, d + i2, c, g);
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_ssm_conv_back(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    ggml_compute_forward_ssm_conv_back_f32(params, dst);
+}
+
 static void ggml_compute_forward_ssm_conv_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
