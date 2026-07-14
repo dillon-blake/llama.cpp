@@ -2032,6 +2032,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ssm_scan(params, tensor);
             } break;
+        case GGML_OP_SSM_SCAN_BACK:
+            {
+                ggml_compute_forward_ssm_scan_back(params, tensor);
+            } break;
         case GGML_OP_WIN_PART:
             {
                 ggml_compute_forward_win_part(params, tensor);
@@ -2410,6 +2414,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_CONV_BACK:
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_SSM_SCAN_BACK:
             {
                 n_tasks = n_threads;
             } break;
@@ -2894,6 +2899,18 @@ struct ggml_cplan ggml_graph_plan(
                             node->src[0]->type == GGML_TYPE_BF16) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
+                    } break;
+                case GGML_OP_SSM_SCAN_BACK:
+                    {
+                        // learning-llamas (S1-31): the forward overwrites its state in place, so
+                        // the backward recomputes and STORES every intermediate state -- n_t + 1 of
+                        // them -- plus one slot for the running state-gradient. Per thread, because
+                        // each thread owns whole sequences.
+                        const struct ggml_tensor * s  = node->src[1];
+                        const struct ggml_tensor * x  = node->src[2];
+                        const int64_t state_sz = s->ne[0]*s->ne[1]*x->ne[1];
+                        const int64_t n_t      = x->ne[2];
+                        cur = ggml_type_size(GGML_TYPE_F32) * state_sz * (n_t + 2) * n_tasks;
                     } break;
                 case GGML_OP_OUT_PROD_ID:
                     {

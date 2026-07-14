@@ -4333,6 +4333,28 @@ struct test_ssm_scan : public test_case {
             bool xbc_overlap = false)
         : type(type), d_state(d_state), head_dim(head_dim), n_head(n_head), n_group(n_group), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), xbc_overlap(xbc_overlap) {}
 
+    // MEASURED (S1-31). The recurrence is checked EXACTLY elsewhere -- against a float64 finite
+    // difference of ggml's OWN forward, all five gradients, in both the Mamba-1 (A per state) and
+    // Mamba-2 (scalar A per head) branches, with a non-uniform objective that includes the packed
+    // STATE region. That is the oracle for a reverse recurrence: it cannot share a bug with my
+    // analytic derivation, because it never sees it.
+    //
+    //   worst FD noise, 20 runs                       2.1e-2
+    //   drop the dA path from d(dt)                   0.57
+    //   seed ds with ZEROS instead of the packed
+    //     state gradient                              0.59   <- the decision this op turns on
+    //   drop y's own contribution to dS               0.44
+    //   use s_{t-1} where s_t belongs in dC           0.51
+    //   drop the softplus derivative                  0.38
+    //
+    // 5e-2 sits 2.4x above the noise and 7.5-12x below every real defect. Five mutations injected,
+    // five caught. The noise is high because the recurrence is EXPONENTIAL in dt*A -- a finite
+    // difference of it amplifies its own rounding, which is exactly why the float64 reference above
+    // is the oracle and this is the wiring-plus-sanity check.
+    double max_maa_err() override {
+        return 5e-2;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * s   = ggml_new_tensor_4d(ctx, type, d_state,  head_dim,     n_head,       n_seqs);
         ggml_tensor * dt  = ggml_new_tensor_3d(ctx, type, n_head,   n_seq_tokens, n_seqs);

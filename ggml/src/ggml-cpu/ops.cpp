@@ -10098,6 +10098,230 @@ void ggml_compute_forward_ssm_conv(
     }
 }
 
+// ggml_compute_forward_ssm_scan_back  (learning-llamas, S1-31)
+//
+// The forward, per sequence i3, head h, dim i1 (ii = i1 + h*nr), state i0:
+//
+//     dt_sp = softplus(dt[h,t])
+//     dA    = exp(dt_sp * A[h])            (Mamba-2: one scalar per head)
+//           = exp(dt_sp * A[i0,h])         (Mamba-1: one per state)
+//     s_t[i0,ii] = s_{t-1}[i0,ii]*dA + B[i0,g,t] * (x[ii,t]*dt_sp)
+//     y[ii,t]    = sum_i0 s_t[i0,ii] * C[i0,g,t]
+//
+// so the backward is a REVERSE recurrence. Walking t from n_t-1 down to 0, carrying `ds` = the
+// gradient of the state *entering* token t+1:
+//
+//     dS[i0,ii]   = ds[i0,ii] + dy[ii,t]*C[i0,g,t]      this token's own output wants the state too
+//     dC[i0,g,t] += s_t[i0,ii] * dy[ii,t]               summed over the heads in group g
+//     dB[i0,g,t] += dS[i0,ii] * x_dt                    likewise
+//     dx[ii,t]    = dt_sp * sum_i0 dS[i0,ii]*B[i0,g,t]
+//     d(dt_sp)   += x[ii,t]*sum_i0 dS*B  +  sum_i0 dS * s_{t-1} * A * dA
+//     ds[i0,ii]   = dS[i0,ii] * dA                      handed to token t-1
+//     ddt[h,t]    = d(dt_sp) * sigmoid(dt[h,t])         softplus' IS the sigmoid
+//
+// TWO THINGS THAT ARE EASY TO GET WRONG, AND BOTH ARE SILENT.
+//
+// 1. `grad` is the WHOLE packed gradient of ssm_scan's dst -- y AND the final states -- and the
+//    state region is NOT zero. MODE_GRAD's objective sums over the packed dst, so
+//    d(sum)/d(s_final) is 1, and a kernel that seeded `ds` with zeros would disagree with the
+//    finite difference and be WRONG TO. It seeds the reverse recurrence at t = n_t.
+//
+//    In training that region genuinely is zero -- the cached state feeds nothing downstream of the
+//    loss -- so honouring it costs nothing there, and it makes cross-ubatch BPTT nearly free later.
+//
+// 2. The forward OVERWRITES the state in place (`s0 = s` each token), so s_{t-1} is gone by the
+//    time the backward needs it -- and it does need it, for d(dt) via the dA path. So the states
+//    are recomputed and STORED, all n_t + 1 of them. That is the store-all strategy: correct,
+//    O(n_t) memory, and the honest starting point for a CPU oracle. Checkpoint-every-K is the
+//    optimization, and it has to be pinned bit-for-bit against this.
+//
+// Threaded by SEQUENCE, not by head -- deliberately. dB and dC accumulate over every head in a
+// group, so a head-partitioned kernel would have several threads writing the same (i0, g, t) and
+// would need atomics: neither deterministic nor free. One thread per sequence owns every output it
+// touches. Parallelism is therefore n_seqs, which is small -- and correctness and determinism
+// (ADR-0002) come first in the kernel the GPU ports will be measured against.
+static void ggml_compute_forward_ssm_scan_back_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * grad = dst->src[0];
+    const ggml_tensor * src0 = dst->src[1];  // s   {d_state, dim, n_head, n_slots}
+    const ggml_tensor * src1 = dst->src[2];  // x   {dim, n_head, n_t, n_s}
+    const ggml_tensor * src2 = dst->src[3];  // dt  {n_head, n_t, n_s}
+    const ggml_tensor * src3 = dst->src[4];  // A   {d_state, n_head} or {1, n_head}
+    const ggml_tensor * src4 = dst->src[5];  // B   {d_state, n_group, n_t, n_s}
+    const ggml_tensor * src5 = dst->src[6];  // C   {d_state, n_group, n_t, n_s}
+    const ggml_tensor * src6 = dst->src[7];  // ids {n_s}
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+    GGML_ASSERT(src2->nb[0] == sizeof(float));
+    GGML_ASSERT(src3->nb[0] == sizeof(float));
+    GGML_ASSERT(src4->nb[0] == sizeof(float));
+    GGML_ASSERT(src5->nb[0] == sizeof(float));
+    GGML_ASSERT(src6->nb[0] == sizeof(int32_t));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nc = src0->ne[0];  // d_state
+    const int64_t nr = src0->ne[1];  // head_dim
+    const int64_t nh = src1->ne[1];  // n_head
+    const int64_t ng = src4->ne[1];  // n_group
+    const int64_t nt = src1->ne[2];  // tokens per sequence
+    const int64_t ns = src1->ne[3];  // sequences
+
+    GGML_ASSERT(nh % ng == 0);
+
+    const int64_t s_off = ggml_nelements(src1) * ggml_element_size(src1);  // size of the y region
+
+    // The packed dst: [ d_s | d_x | d_dt | d_B | d_C ]
+    const int64_t n_s_el  = ggml_nelements(src0);
+    const int64_t n_x_el  = ggml_nelements(src1);
+    const int64_t n_dt_el = ggml_nelements(src2);
+    const int64_t n_B_el  = ggml_nelements(src4);
+
+    float * d_s  = (float *) dst->data;
+    float * d_x  = d_s  + n_s_el;
+    float * d_dt = d_x  + n_x_el;
+    float * d_B  = d_dt + n_dt_el;
+    float * d_C  = d_B  + n_B_el;
+
+    // Zeroed once, before anyone accumulates. d_s has one slot per STATE SLOT, and a slot no
+    // sequence maps to has to come out zero rather than uninitialized.
+    if (ith == 0) {
+        ggml_vec_set_f32(ggml_nelements(dst), (float *) dst->data, 0.0f);
+    }
+    ggml_barrier(params->threadpool);
+
+    // Per-thread scratch: n_t + 1 stored states, plus one slot for the running ds.
+    const int64_t state_sz = nc*nr*nh;
+    float * scratch = (float *) params->wdata + (size_t) ith*state_sz*(nt + 2);
+    float * states  = scratch;
+    float * ds      = scratch + (nt + 1)*state_sz;
+
+    const int32_t * ids = (const int32_t *) src6->data;
+
+    const bool scalar_A = (src3->ne[0] == 1);
+    const float * A = (const float *) src3->data;
+
+    for (int64_t i3 = ith; i3 < ns; i3 += nth) {
+        // ---- forward recompute, storing every state --------------------------------------------
+        {
+            const float * s0 = (const float *) ((const char *) src0->data + ids[i3]*src0->nb[3]);
+            memcpy(states, s0, state_sz*sizeof(float));
+
+            for (int64_t i2 = 0; i2 < nt; ++i2) {
+                const float * x  = (const float *) ((const char *) src1->data + i2*src1->nb[2] + i3*src1->nb[3]);
+                const float * dt = (const float *) ((const char *) src2->data + i2*src2->nb[1] + i3*src2->nb[2]);
+                const float * B  = (const float *) ((const char *) src4->data + i2*src4->nb[2] + i3*src4->nb[3]);
+
+                const float * sp = states + i2*state_sz;        // s_{t-1}
+                float       * sn = states + (i2 + 1)*state_sz;  // s_t
+
+                for (int64_t h = 0; h < nh; ++h) {
+                    const float dt_sp = ggml_compute_softplus_f32(dt[h]);
+                    const int64_t g   = h / (nh / ng);
+
+                    for (int64_t i1 = 0; i1 < nr; ++i1) {
+                        const int64_t ii   = i1 + h*nr;
+                        const float   x_dt = x[ii] * dt_sp;
+
+                        for (int64_t i0 = 0; i0 < nc; ++i0) {
+                            const float a  = scalar_A ? A[h] : A[i0 + h*nc];
+                            const float dA = expf(dt_sp * a);
+
+                            sn[i0 + ii*nc] = sp[i0 + ii*nc]*dA + B[i0 + g*nc]*x_dt;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- reverse pass -----------------------------------------------------------------------
+
+        // Seeded from grad's STATE region, not from zero. See note 1 above.
+        {
+            const float * gs = (const float *) ((const char *) grad->data + s_off + i3*src0->nb[3]);
+            memcpy(ds, gs, state_sz*sizeof(float));
+        }
+
+        for (int64_t i2 = nt - 1; i2 >= 0; --i2) {
+            const float * x  = (const float *) ((const char *) src1->data + i2*src1->nb[2] + i3*src1->nb[3]);
+            const float * dt = (const float *) ((const char *) src2->data + i2*src2->nb[1] + i3*src2->nb[2]);
+            const float * B  = (const float *) ((const char *) src4->data + i2*src4->nb[2] + i3*src4->nb[3]);
+            const float * C  = (const float *) ((const char *) src5->data + i2*src5->nb[2] + i3*src5->nb[3]);
+
+            const float * dy = (const float *) ((const char *) grad->data
+                                 + i2*(nh*nr*sizeof(float)) + i3*(nt*nh*nr*sizeof(float)));
+
+            const float * sp = states + i2*state_sz;        // s_{t-1}
+            const float * sn = states + (i2 + 1)*state_sz;  // s_t
+
+            float * dxt  = d_x  + i2*(nh*nr) + i3*(nt*nh*nr);
+            float * ddtt = d_dt + i2*nh      + i3*(nt*nh);
+            float * dBt  = d_B  + i2*(nc*ng) + i3*(nt*nc*ng);
+            float * dCt  = d_C  + i2*(nc*ng) + i3*(nt*nc*ng);
+
+            for (int64_t h = 0; h < nh; ++h) {
+                const float dt_raw = dt[h];
+                const float dt_sp  = ggml_compute_softplus_f32(dt_raw);
+                const float sig    = 1.0f/(1.0f + expf(-dt_raw));   // softplus'(dt) is the sigmoid
+                const int64_t g    = h / (nh / ng);
+
+                float d_dt_sp = 0.0f;
+
+                for (int64_t i1 = 0; i1 < nr; ++i1) {
+                    const int64_t ii   = i1 + h*nr;
+                    const float   x_dt = x[ii] * dt_sp;
+                    const float   gy   = dy[ii];
+
+                    float dot_B = 0.0f;   // sum_i0  dS * B
+                    float dot_A = 0.0f;   // sum_i0  dS * s_{t-1} * A * dA     (the dA path)
+
+                    for (int64_t i0 = 0; i0 < nc; ++i0) {
+                        const float a  = scalar_A ? A[h] : A[i0 + h*nc];
+                        const float dA = expf(dt_sp * a);
+
+                        // The state's total gradient: what the later tokens sent back, plus what
+                        // this token's own output wants of it.
+                        const float dS = ds[i0 + ii*nc] + gy*C[i0 + g*nc];
+
+                        dCt[i0 + g*nc] += sn[i0 + ii*nc] * gy;
+                        dBt[i0 + g*nc] += dS * x_dt;
+
+                        dot_B += dS * B[i0 + g*nc];
+                        dot_A += dS * sp[i0 + ii*nc] * a * dA;
+
+                        // Hand the state gradient back one token. Overwriting ds in place is safe:
+                        // nothing later in this iteration reads the old value.
+                        ds[i0 + ii*nc] = dS * dA;
+                    }
+
+                    dxt[ii]  = dt_sp * dot_B;
+                    d_dt_sp += x[ii]*dot_B + dot_A;
+                }
+
+                ddtt[h] = d_dt_sp * sig;
+            }
+        }
+
+        // Whatever gradient is left in ds after t = 0 belongs to the INITIAL state.
+        float * d_s_i3 = d_s + ids[i3]*state_sz;
+        for (int64_t k = 0; k < state_sz; ++k) {
+            d_s_i3[k] += ds[k];
+        }
+    }
+}
+
+void ggml_compute_forward_ssm_scan_back(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    ggml_compute_forward_ssm_scan_back_f32(params, dst);
+}
+
 // ggml_compute_forward_ssm_scan
 
 static void ggml_compute_forward_ssm_scan_f32(
