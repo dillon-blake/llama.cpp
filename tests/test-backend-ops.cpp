@@ -4204,6 +4204,41 @@ struct test_ssm_conv : public test_case {
             std::array<int64_t, 4> ne_b = {3, 3, 1, 1})
         : type(type), ne_a(ne_a), ne_b(ne_b) {}
 
+    // Under MODE_GRAD's default sum(out) objective THIS OP'S GRADIENT TEST IS VACUOUS.
+    //
+    // sum(out) makes the incoming gradient all-ones, and the kernel's scatter is
+    //
+    //     d_sx[i2 + i0] += dy[i1,i2,i3] * c[i0,i1]
+    //
+    // so with dy == 1 a kernel that IGNORES dy entirely and scatters c alone produces exactly the
+    // same answer. Measured: that mutation is not caught at all under sum(out), and is caught at
+    // MAA 0.47 with a weighted objective. Same trap, same fix, as SOFT_MAX (S1-34) and MUL_MAT_ID
+    // (S1-27) -- an op can be invisible to sum(out) for structural reasons and then its grad test
+    // checks nothing while reporting OK.
+    ggml_tensor * grad_loss(ggml_context * ctx, ggml_tensor * out) override {
+        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, out->ne);
+        ggml_set_name(w, "grad_loss_weights");
+
+        return ggml_sum(ctx, ggml_mul(ctx, out, w));
+    }
+
+    // MEASURED (S1-30), with numbers on both sides:
+    //
+    //   worst FD noise, 25 runs            2.2e-3   (on the widest shapes, d_inner = 1024/2048)
+    //   ignore the incoming gradient       0.84     -- and INVISIBLE without grad_loss, see above
+    //   shift the scatter window by 1      0.52
+    //   drop the last conv tap             0.47
+    //
+    // 1e-2 sits 4.5x above the noise and 47-84x below every real defect. Three mutations injected,
+    // three caught.
+    //
+    // The kernel is ALSO checked exactly: against a naive DOUBLE reference, and with a TRANSPOSED
+    // grad (nb[0] != 4) -- the stride trap that bit both MoE kernels and GLU_BACK. Exact to ~1e-7
+    // in both layouts.
+    double max_maa_err() override {
+        return 1e-2;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_set_name(a, "sx");
