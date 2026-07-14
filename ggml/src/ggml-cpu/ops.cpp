@@ -4552,6 +4552,12 @@ static void ggml_compute_forward_out_prod_id_grp_f32(
 
     GGML_ASSERT(dst->nb[0] == sizeof(float));
 
+    // b is the VECTOR operand of ggml_vec_mad_f32, so its dim-0 has to be contiguous -- a strided
+    // read is not merely wrong here, it is unrepresentable. src1 (grad) and src2 (ids) are read
+    // element-by-element through their strides instead, and must NOT be asserted contiguous: ggml
+    // hands this op transposed grads, and the forward accepts strided ids.
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+
     const int ith = params->ith;
     const int nth = params->nth;
 
@@ -4578,10 +4584,17 @@ static void ggml_compute_forward_out_prod_id_grp_f32(
         }
 
         for (int64_t t = 0; t < n_tok; ++t) {
-            const int32_t * ids_t = (const int32_t *) ((const char *) src2->data + t*src2->nb[1]);
+            const char * ids_t = (const char *) src2->data + t*src2->nb[1];
 
             for (int64_t i = 0; i < n_ids; ++i) {
-                if (ids_t[i] != (int32_t) e) {
+                // ids is read through nb[0], NOT as int32_t*[i]. The FORWARD reads it that way
+                // (ggml_compute_forward_mul_mat_id: `*(int32_t *)(ids->data + iid1*nb[1] + id*nb[0])`)
+                // and ggml_mul_mat_id puts no contiguity constraint on ids -- so a strided ids is a
+                // legal tensor that the forward computes CORRECTLY. A hard-coded 4-byte stride here
+                // would make the backward disagree with the forward about which expert each slot
+                // chose, and credit the wrong experts. Silently.
+                const int32_t e_i = *(const int32_t *) (ids_t + i*src2->nb[0]);
+                if (e_i != (int32_t) e) {
                     continue;
                 }
 
@@ -4589,12 +4602,22 @@ static void ggml_compute_forward_out_prod_id_grp_f32(
                 // reads column i % ne_b1 -- and the gradient must gather from the same column.
                 const float * b_col = (const float *) ((const char *) src0->data
                                         + (i % ne_b1)*src0->nb[1] + t*src0->nb[2]);
-                const float * g_col = (const float *) ((const char *) src1->data
-                                        + i*src1->nb[1] + t*src1->nb[2]);
+                const char * g_col = (const char *) src1->data
+                                        + i*src1->nb[1] + t*src1->nb[2];
 
-                // d_as[:, j, e] += g_col[j] * b_col[:]
+                // d_as[:, j, e] += grad[j,i,t] * b_col[:]
                 for (int64_t j = 0; j < m; ++j) {
-                    ggml_vec_mad_f32(n, (float *) ((char *) d_e + j*dst->nb[1]), b_col, g_col[j]);
+                    // grad is read through nb[0] too, and this is not paranoia: ggml's autodiff
+                    // hands transposed grads to out-prod-shaped ops as a matter of course. The
+                    // MUL_MAT backward passes ggml_transpose(grad) to ggml_out_prod, which is why
+                    // ggml_compute_forward_out_prod_f32 reads src1 through `i1*nb10` rather than
+                    // indexing a float*. This kernel is modelled on that one and had dropped it.
+                    //
+                    // A TRANSPOSE node reaching here has nb[0] == 8, and a float*[j] read of it
+                    // silently returns the wrong element. No assert fires; the run just trains on a
+                    // wrong weight gradient.
+                    const float gj = *(const float *) (g_col + j*src1->nb[0]);
+                    ggml_vec_mad_f32(n, (float *) ((char *) d_e + j*dst->nb[1]), b_col, gj);
                 }
             }
         }
@@ -4680,17 +4703,20 @@ static void ggml_compute_forward_out_prod_id_f32(
             ggml_vec_set_f32(n, (float *) ((char *) dst->data + l*dst->nb[1] + t*dst->nb[2]), 0.0f);
         }
 
-        const int32_t * ids_t = (const int32_t *) ((const char *) src2->data + t*src2->nb[1]);
+        const char * ids_t = (const char *) src2->data + t*src2->nb[1];
 
         for (int64_t i = 0; i < n_ids; ++i) {
-            const int32_t e = ids_t[i];
+            // ids and grad are both read through nb[0] -- see the long comment in
+            // ggml_compute_forward_out_prod_id_grp_f32. The forward reads ids strided, and ggml's
+            // autodiff routinely produces transposed grads; a hard-coded 4-byte stride on either
+            // is a silent wrong answer, not a crash.
+            const int32_t e = *(const int32_t *) (ids_t + i*src2->nb[0]);
             GGML_ASSERT(e >= 0 && e < n_expert);
 
             // The forward broadcasts b's column across slots when ne_b1 < n_ids, so several slots
             // of this token accumulate into the SAME dst column. That is the ne_b1 == 1 case.
             float * d_col = (float *) ((char *) dst->data + (i % ne_b1)*dst->nb[1] + t*dst->nb[2]);
-            const float * g_col = (const float *) ((const char *) src1->data
-                                    + i*src1->nb[1] + t*src1->nb[2]);
+            const char * g_col = (const char *) src1->data + i*src1->nb[1] + t*src1->nb[2];
 
             for (int64_t j = 0; j < m; ++j) {
                 const char * as_row = (const char *) src0->data + j*src0->nb[1] + e*src0->nb[2];
@@ -4703,7 +4729,8 @@ static void ggml_compute_forward_out_prod_id_f32(
                     a = wdata;
                 }
 
-                ggml_vec_mad_f32(n, d_col, a, g_col[j]);
+                const float gj = *(const float *) (g_col + j*src1->nb[0]);
+                ggml_vec_mad_f32(n, d_col, a, gj);
             }
         }
     }

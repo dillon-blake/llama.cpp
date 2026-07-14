@@ -4316,9 +4316,11 @@ struct test_mul_mat_id : public test_case {
     // learning-llamas: bit 1 = ask for d(as) [OUT_PROD_ID_GRP], bit 2 = ask for d(b) [OUT_PROD_ID].
     // 0 keeps the case eval-only, which is what every pre-existing instantiation wants.
     const int grad_param;
+    // Force a NON-CONTIGUOUS grad to reach mul_mat_id's backward. See grad_loss.
+    const bool grad_transposed;
 
     std::string vars() override {
-        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, grad_param);
+        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, grad_param, grad_transposed);
     }
 
     double max_nmse_err() override {
@@ -4340,9 +4342,10 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32, int grad_param = 0)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, int grad_param = 0,
+            bool grad_transposed = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), grad_param(grad_param) {
+            m(m), n(n), k(k), grad_param(grad_param), grad_transposed(grad_transposed) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4376,10 +4379,27 @@ struct test_mul_mat_id : public test_case {
     }
 
     ggml_tensor * grad_loss(ggml_context * ctx, ggml_tensor * out) override {
-        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, out->ne);
+        // grad_transposed routes the objective through cont(transpose(out)), which makes
+        // ggml_build_backward_expand hand MUL_MAT_ID's backward a grad whose op is TRANSPOSE --
+        // i.e. nb[0] == 8, not 4.
+        //
+        // This is not a contrived shape. ggml's autodiff produces transposed grads as a matter of
+        // course (the MUL_MAT backward passes ggml_transpose(grad) straight to ggml_out_prod, which
+        // is exactly why ggml_compute_forward_out_prod_f32 reads src1 through `i1*nb10` instead of
+        // indexing a float*). Both OUT_PROD_ID kernels originally indexed grad as g_col[j] -- a
+        // hard-coded 4-byte stride -- and silently read the wrong elements. Without this case, no
+        // test in the suite would ever have built a non-contiguous grad, so nothing would have said
+        // so: the run just trains on a wrong gradient.
+        ggml_tensor * o = out;
+        if (grad_transposed) {
+            o = ggml_cont(ctx, ggml_transpose(ctx, out));
+            ggml_set_name(o, "transposed_out");
+        }
+
+        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, o->ne);
         ggml_set_name(w, "grad_loss_weights");
 
-        return ggml_sum(ctx, ggml_mul(ctx, out, w));
+        return ggml_sum(ctx, ggml_mul(ctx, o, w));
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -9231,9 +9251,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 // With 32 tokens each expert accumulates ~20 slots, so every gradient element is a
                 // sum of many terms and is far from zero. The fix is to condition the test, not to
                 // widen the tolerance until the flapping stops.
-                test_cases.emplace_back(new test_mul_mat_id(
-                    GGML_TYPE_F32, GGML_TYPE_F32, /*n_mats =*/ 3, n_used, bcast,
-                    /*m =*/ 6, /*n =*/ 32, /*k =*/ 4, grad_param));
+                for (bool tgrad : {false, true}) {
+                    test_cases.emplace_back(new test_mul_mat_id(
+                        GGML_TYPE_F32, GGML_TYPE_F32, /*n_mats =*/ 3, n_used, bcast,
+                        /*m =*/ 6, /*n =*/ 32, /*k =*/ 4, grad_param, tgrad));
+                }
             }
         }
     }
