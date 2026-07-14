@@ -4206,8 +4206,25 @@ struct test_ssm_conv : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
+        ggml_set_name(a, "sx");
+
+        // learning-llamas (S1-29b): ask for the gradient.
+        //
+        // This class called ggml_set_param ZERO times, so `grad -o SSM_CONV` requested no
+        // gradients, compared nothing, and printed `Backend CPU: OK` -- while SSM_CONV had no
+        // backward case at all and would have aborted the moment one was asked for.
+        //
+        // `b` is the conv weight: a frozen base weight on the LoRA path (ROADMAP E8), so it is not
+        // a param and the backward case asserts as much rather than silently producing nothing.
+        if (type == GGML_TYPE_F32) {
+            ggml_set_param(a);
+        }
+
         ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
+        ggml_set_name(b, "c");
+
         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
+        ggml_set_name(out, "out");
         return out;
     }
 };
@@ -4302,8 +4319,39 @@ struct test_ssm_scan : public test_case {
             B = ggml_new_tensor_4d(ctx, type, d_state,  n_group, n_seq_tokens, n_seqs);
             C = ggml_new_tensor_4d(ctx, type, d_state,  n_group, n_seq_tokens, n_seqs);
         }
+        ggml_set_name(s,  "s");
+        ggml_set_name(x,  "x");
+        ggml_set_name(dt, "dt");
+        ggml_set_name(A,  "A");
+        ggml_set_name(B,  "B");
+        ggml_set_name(C,  "C");
+
+        // learning-llamas (S1-29b): ask for the gradients.
+        //
+        // This class called ggml_set_param ZERO times, so `grad -o SSM_SCAN` requested no
+        // gradients, compared nothing, and printed `Backend CPU: OK` -- while SSM_SCAN had no
+        // backward case at all and would have aborted the moment one was asked for.
+        //
+        // Five of the seven sources take a gradient: s, x, dt, B, C. A (the decay matrix) does not
+        // -- it is a frozen base weight on the LoRA path (ROADMAP E8) -- and ids is I32.
+        //
+        // The xbc_overlap variants make x, B and C VIEWS of one tensor, and ggml_set_param asserts
+        // op == GGML_OP_NONE, so those cases stay eval-only. That is a coverage gap and it is
+        // stated rather than hidden: overlapping x/B/C is a real llama.cpp layout, and its backward
+        // aliasing is exactly the sort of thing that goes wrong quietly. S1-31 owns it.
+        if (type == GGML_TYPE_F32 && !xbc_overlap) {
+            ggml_set_param(s);
+            ggml_set_param(x);
+            ggml_set_param(dt);
+            ggml_set_param(B);
+            ggml_set_param(C);
+        }
+
         ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,  n_seqs);
+        ggml_set_name(ids, "ids");
+
         ggml_tensor * out = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids);
+        ggml_set_name(out, "out");
         return out;
     }
 
@@ -9282,6 +9330,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int64_t d_conv : {3, 4, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {
+            // learning-llamas (S1-29b): a TINY shape, so the MODE_GRAD case is not silently
+            // skipped for size once S1-30's kernel lands. n_t = 4, so the convolution genuinely
+            // slides rather than degenerating to a single window.
+            test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4 - 1 + 4, 8, 2, 1}, {4, 8, 1, 1}));
+
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {2 * d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
@@ -9311,6 +9364,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // learning-llamas (S1-29b): TINY gradient shapes.
+    //
+    // grad_nmax() is 10000 parameter elements and every shape below is far above it, so under
+    // MODE_GRAD they are all SILENTLY SKIPPED -- and the case still prints OK. Without these, the
+    // day S1-31's kernel lands there would be nothing for it to be checked by.
+    //
+    // Mamba-1 shape (head_dim == 1, so A is per-state) and Mamba-2 (head_dim > 1, A is scalar per
+    // head): the two branches are different code in the kernel and both need a gradient case.
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, /*d_state=*/ 4, /*head_dim=*/ 1,
+                                              /*n_head=*/ 3, /*n_group=*/ 1,
+                                              /*n_seq_tokens=*/ 3, /*n_seqs=*/ 2)); // Mamba-1, grad
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, /*d_state=*/ 4, /*head_dim=*/ 2,
+                                              /*n_head=*/ 2, /*n_group=*/ 1,
+                                              /*n_seq_tokens=*/ 3, /*n_seqs=*/ 2)); // Mamba-2, grad
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 32, 4)); // Mamba-2
