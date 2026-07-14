@@ -480,14 +480,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_SSM_SCAN_BACK:
-            // learning-llamas (S1-29b): declared, not yet implemented. The kernel lands in S1-31,
-            // which flips this to a real check.
-            //
-            // This case is NOT redundant. The default below returns TRUE, so a new op with no
-            // dispatch case is reported *supported* by the CPU backend, gets scheduled, and then
-            // hits ggml_compute_forward's `default: GGML_ABORT`. It would look implemented right up
-            // until it killed the process. Same trap S1-25 hit.
-            return false;
+            // learning-llamas (S1-31): F32 throughout, like the forward.
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32;
         case GGML_OP_GLU_BACK:
             // learning-llamas (S1-28): F32 throughout. The GLU forwards accept F16, but a gradient
             // is F32 on this project's training path by policy (ADR-0002), and there is no caller
