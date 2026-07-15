@@ -242,6 +242,7 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-glu-back.cpp)  # learning-llamas S1-28: the GLU_BACK numerics oracle
+llama_build_and_test(test-soft-max-back-inplace.cpp)  # learning-llamas S1-41: SOFT_MAX_BACK aliased onto src1
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

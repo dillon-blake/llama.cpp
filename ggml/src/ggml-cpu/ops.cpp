@@ -6044,10 +6044,31 @@ static void ggml_compute_forward_soft_max_ext_back_f32(
         // linear runtime, no additional memory
         float dot_y_dy = 0;
         ggml_vec_dot_f32  (nc, &dot_y_dy, 0, y, 0, dy, 0, 1);
-        ggml_vec_cpy_f32  (nc, dx, dy);
-        ggml_vec_acc1_f32 (nc, dx, -dot_y_dy);
-        ggml_vec_mul_f32  (nc, dx, dx, y);
-        ggml_vec_scale_f32(nc, dx, scale);
+
+        // learning-llamas (S1-41): compute dx = scale * y * (dy - <y,dy>) ELEMENT-WISE, not with
+        // the cpy/acc/mul vector sequence this used to run. The trap is an in-place ALIAS the
+        // ordinary graph never hits but the MoE router backward does.
+        //
+        // GGML_OP_SOFT_MAX_BACK is on ggml_op_can_inplace's list (ggml-alloc.c), so ggml-gallocr may
+        // put dst on top of a src buffer. It walks src[0] (grad, = dy) first, then src[1] (the
+        // softmax OUTPUT, = y), and reuses the first whose only remaining consumer is this node.
+        // For attention, y is also read by the V matmul's backward, so it is never that lone
+        // consumer and dst never lands on it. For a Mixtral router, y feeds only argsort (no grad)
+        // and get_rows (which reads the ids, not y) -- so at backward time THIS op is y's sole
+        // consumer, and gallocr aliases dst onto y.
+        //
+        // The old sequence was safe against dst==dy (cpy is then a no-op) but NOT against dst==y:
+        // `cpy(dx,dy)` overwrote the whole y buffer, then `mul(dx,dx,y)` read that clobbered y and
+        // produced ~(dy - <y,dy>)^2 instead of y*(dy - <y,dy>). d_logits collapsed toward zero, the
+        // router weights got no gradient, and every LoRA upstream of an MoE block trained on a dh
+        // that silently dropped its router term. The forward, the loss, and the expert-weight grads
+        // all stayed correct, which is why it hid.
+        //
+        // Reading y[i] and dy[i] before writing dx[i], with <y,dy> already reduced, is correct
+        // whether dst aliases y, aliases dy, or aliases neither -- and it is one pass, not four.
+        for (int i = 0; i < nc; ++i) {
+            dx[i] = scale * y[i] * (dy[i] - dot_y_dy);
+        }
 
 #ifndef NDEBUG
         for (int i = 0; i < nc; ++i) {
