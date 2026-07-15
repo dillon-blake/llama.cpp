@@ -7129,7 +7129,14 @@ static void ggml_compute_backward(
                     nb3 = (nb3 / n0) * ng;
                 }
 
-                ggml_acc_or_set(ctx, cgraph, isrc0, grad, nb1, nb2, nb3, offset);
+                // ggml_acc scatter-adds `grad` into src0's grad buffer, and its kernel reads the
+                // accumuland contiguously (asserts nb[0] == sizeof(float)). `grad` need not be
+                // contiguous: a view whose only consumer is a transpose gets a transposed (hence
+                // non-contiguous) gradient -- the Mamba conv does exactly this, splitting ssm_in's
+                // output with a view and feeding it through ggml_transpose (learning-llamas S1-47).
+                // Materialize it first, matching how the RESHAPE backward above already guards.
+                struct ggml_tensor * grad_acc = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+                ggml_acc_or_set(ctx, cgraph, isrc0, grad_acc, nb1, nb2, nb3, offset);
             }
         } break;
         case GGML_OP_PERMUTE: {
@@ -7467,6 +7474,17 @@ static void ggml_compute_backward(
             GGML_ASSERT(!need_A && "SSM A-matrix gradients are not implemented (ROADMAP E8)");
 
             if (need_s || need_x || need_dt || need_B || need_C) {
+                // n_group is ssm_B->ne[1]. The kernel routes heads to per-group dB/dC slabs via
+                // g = h/(nh/ng), and that routing has NO finite-difference oracle: every grad-
+                // enabled SSM_SCAN case in test-backend-ops is n_group == 1 (the n_group > 1 shapes
+                // exceed grad_nmax and are skipped). Mamba-1 always builds n_group == 1, and the
+                // learning-llamas Mamba-1 e2e (S1-47) verifies that path against a float64 oracle.
+                // n_group > 1 (real Mamba-2 / Falcon-H1) is refused here rather than trained on an
+                // unverified gradient -- see tickets/backlog for the group-index grad oracle.
+                GGML_ASSERT(ssm_B->ne[1] == 1 &&
+                    "SSM_SCAN backward with n_group > 1 has no gradient oracle yet; refusing to "
+                    "train it (learning-llamas S1-47). Mamba-1 (n_group == 1) is verified.");
+
                 struct ggml_tensor * gb = ggml_ssm_scan_back(
                         ctx, grad, ssm_s, ssm_x, ssm_dt, ssm_A, ssm_B, ssm_C, ssm_id);
 

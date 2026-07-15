@@ -115,6 +115,15 @@ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
         auto get_ssm_rows = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
             ggml_tensor * ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, mctx_cur->get_size());
 
+            // learning-llamas (S1-47): `ssm` is a view of the recurrent-state cache, and the block
+            // below overwrites that cache in place with the final state. ggml_ssm_scan_back
+            // recomputes the intermediate states from this initial state, so it must read the value
+            // the forward saw -- but by backward time the cache holds the *final* state, silently
+            // corrupting every scan gradient of every layer but the last. Copy it into its own
+            // buffer so the in-place update cannot reach the backward's input. The copy is small
+            // (one state slab) and only load-bearing on the training path.
+            ssm = ggml_cont(ctx, ssm);
+
             // Custom operator to optimize the parallel associative scan
             // as described in the Annex D of the Mamba paper.
             // => {d_inner, n_seq_tokens, n_seqs} and {d_state, d_inner, n_seqs}
@@ -245,6 +254,11 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         //  while avoiding to make unnecessary copies of the states)
         auto get_ssm_rows = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
             ggml_tensor * ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, mctx_cur->get_size());
+
+            // learning-llamas (S1-47): copy the initial state out of the in-place-updated recurrent
+            // cache so ggml_ssm_scan_back reads the value the forward saw, not the overwritten final
+            // state. Same reasoning as the Mamba-1 path above.
+            ssm = ggml_cont(ctx, ssm);
 
             // TODO: use semistructured matrices to implement state-space duality
             // => {d_inner, n_seq_tokens, n_seqs} and {d_state, d_inner, n_seqs}
