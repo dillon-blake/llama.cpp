@@ -4367,6 +4367,7 @@ struct test_ssm_scan : public test_case {
         return VARS_TO_STR8(type, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, xbc_overlap);
     }
 
+
     test_ssm_scan(ggml_type type = GGML_TYPE_F32,
             int64_t d_state = 32,
             int64_t head_dim = 1, // non-zero for Mamba-2
@@ -4391,12 +4392,15 @@ struct test_ssm_scan : public test_case {
     //   use s_{t-1} where s_t belongs in dC           0.51
     //   drop the softplus derivative                  0.38
     //
-    // 5e-2 sits 2.4x above the noise and 7.5-12x below every real defect. Five mutations injected,
-    // five caught. The noise is high because the recurrence is EXPONENTIAL in dt*A -- a finite
-    // difference of it amplifies its own rounding, which is exactly why the float64 reference above
-    // is the oracle and this is the wiring-plus-sanity check.
+    // 5e-2 sat 2.4x above the noise measured under glibc -- and then MSVC's libm produced a draw
+    // at 0.0558 (ci-windows, S1-50): the noise floor is platform-rounding-dependent and the 2.4x
+    // margin was a one-libm measurement. 1e-1 keeps 3.8x below the smallest injected defect (0.38,
+    // table above) while covering the observed cross-libm spread. Five mutations injected, five
+    // caught -- at either threshold. The noise is high because the recurrence is EXPONENTIAL in
+    // dt*A: a finite difference of it amplifies its own rounding, which is exactly why the float64
+    // reference above is the oracle and this is the wiring-plus-sanity check.
     double max_maa_err() override {
-        return 5e-2;
+        return 1e-1;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
