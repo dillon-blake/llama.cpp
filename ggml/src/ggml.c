@@ -1097,9 +1097,17 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "CROSS_ENTROPY_LOSS_SPARSE",
     "CROSS_ENTROPY_LOSS_SPARSE_BACK",
+
+    "OUT_PROD_ID",
+    "OUT_PROD_ID_GRP",
+
+    "GLU_BACK",
+
+    "SSM_CONV_BACK",
+    "SSM_SCAN_BACK",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1211,9 +1219,17 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "cross_entropy_loss_sparse(x,y,w)",
     "cross_entropy_loss_sparse_back(x,y,w)",
+
+    "out_prod_id(as,grad,ids)",
+    "out_prod_id_grp(b,grad,ids)",
+
+    "glu_back(grad,a,b)",
+
+    "ssm_conv_back(dy,sx,c)",
+    "ssm_scan_back(grad,...)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2915,6 +2931,59 @@ static struct ggml_tensor * ggml_glu_impl(
     return result;
 }
 
+// ggml_glu_back (learning-llamas, S1-28)
+
+struct ggml_tensor * ggml_glu_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        enum ggml_glu_op      op,
+        bool                  swapped,
+        float                 alpha,
+        float                 limit) {
+    GGML_ASSERT(ggml_is_contiguous_1(a));
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+
+    if (b) {
+        GGML_ASSERT(ggml_is_contiguous_1(b));
+        GGML_ASSERT(ggml_are_same_shape(a, b));
+        GGML_ASSERT(b->type == GGML_TYPE_F32);
+        GGML_ASSERT(a->ne[0] == grad->ne[0]);      // split: each half is the output width
+    } else {
+        // Fused: a packs both halves. NOT `a->ne[0] == 2*nc` -- ggml_glu computes its output width
+        // as a->ne[0]/2 with INTEGER division, so an odd-width `a` (test-backend-ops sweeps
+        // ne_a[0] = 5) leaves a trailing element the forward never reads. It gets a zero gradient,
+        // and dst has to be wide enough to hold it, or d_a would not be a->ne[0] wide and
+        // ggml_compute_backward's same-shape assert would fire.
+        GGML_ASSERT(a->ne[0] >= 2*grad->ne[0]);
+        GGML_ASSERT(a->ne[0] / 2 == grad->ne[0]);
+    }
+
+    // dst has d_a's shape: the fused input's own width (so the unused tail is representable), or
+    // 2*nc for a split input, where the caller views half 0 as d_a and half 1 as d_b.
+    int64_t ne[GGML_MAX_DIMS] = { b ? 2*grad->ne[0] : a->ne[0] };
+    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+        ne[i] = grad->ne[i];
+    }
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, ne);
+
+    // Same op_param layout as ggml_glu_impl, deliberately: the backward case copies them straight
+    // off the forward node, so a divergence here would be a silent behaviour change.
+    ggml_set_op_params_i32(result, 0, (int32_t) op);
+    ggml_set_op_params_i32(result, 1, (int32_t) swapped);
+    ggml_set_op_params_f32(result, 2, alpha);
+    ggml_set_op_params_f32(result, 3, limit);
+
+    result->op     = GGML_OP_GLU_BACK;
+    result->src[0] = grad;
+    result->src[1] = a;
+    result->src[2] = b;
+
+    return result;
+}
+
 // ggml_floor
 
 struct ggml_tensor * ggml_floor(
@@ -3362,6 +3431,93 @@ struct ggml_tensor * ggml_out_prod(
     result->op     = GGML_OP_OUT_PROD;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_out_prod_id / ggml_out_prod_id_grp (learning-llamas, S1-25)
+//
+// The two halves of MUL_MAT_ID's backward. Given the forward
+//
+//     mul_mat_id(as, b, ids):  dst[j,i,t] = sum_k as[k,j, ids[i,t]] * b[k, i % ne_b1, t]
+//
+//   as   [n, m, n_expert]     the 3D expert stack
+//   b    [n, ne_b1, n_tok]    activations; ne_b1 is 1 in every build_moe_ffn graph
+//   ids  [n_ids, n_tok] I32   which experts token t routed to
+//   dst  [m, n_ids, n_tok]
+//
+// the gradients are
+//
+//     d(b) [k, l, t]     = sum_{i : i % ne_b1 == l} sum_j grad[j,i,t] * as[k,j, ids[i,t]]
+//     d(as)[k, j, e]     = sum_{(i,t) : ids[i,t] == e}      grad[j,i,t] * b[k, i % ne_b1, t]
+//
+// Both are gather/scatter-with-accumulation, which is why neither is expressible as an existing
+// op: OUT_PROD has no notion of an index tensor, and the expert axis is not a broadcast axis --
+// it is a *selection*. Two experts can be chosen by the same token (different i), and one expert
+// by many tokens; both cases accumulate, and getting that wrong is silent.
+//
+// Kernels land in S1-26 (OUT_PROD_ID) and S1-27 (OUT_PROD_ID_GRP). Until then no backend
+// advertises support, so a graph containing them builds but will not schedule.
+
+struct ggml_tensor * ggml_out_prod_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * ids,
+        int64_t               ne_b1) {
+    GGML_ASSERT(!ggml_is_transposed(as));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(as->ne[3] == 1);                     // as is 3d (one matrix per expert)
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
+    GGML_ASSERT(grad->ne[0] == as->ne[1]);           // grad's row dim is the expert output dim
+    GGML_ASSERT(grad->ne[1] == ids->ne[0]);          // one grad column per (slot, token)
+    GGML_ASSERT(grad->ne[2] == ids->ne[1]);          // ...and one ids row per token
+
+    // d(b) has b's shape, and b's middle dim is NOT recoverable from `as`, `grad` or `ids`: the
+    // forward broadcasts b's columns across slots whenever ids->ne[0] is a multiple of it. Assume
+    // 1 (which is all build_moe_ffn ever produces) and a broadcasting graph would silently get a
+    // wrong-shaped gradient, so take it as an argument and assert the forward's rule instead.
+    GGML_ASSERT(ne_b1 > 0);
+    GGML_ASSERT(ids->ne[0] % ne_b1 == 0);
+
+    const int64_t ne[4] = { as->ne[0], ne_b1, ids->ne[1], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_OUT_PROD_ID;
+    result->src[0] = as;
+    result->src[1] = grad;
+    result->src[2] = ids;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_out_prod_id_grp(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * ids,
+        int64_t               n_expert) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(b->ne[3] == 1);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ids->ne[1] == b->ne[2]);             // one expert list per token
+    GGML_ASSERT(ids->ne[0] % b->ne[1] == 0);         // the forward's broadcast rule
+    GGML_ASSERT(grad->ne[1] == ids->ne[0]);
+    GGML_ASSERT(grad->ne[2] == ids->ne[1]);
+    GGML_ASSERT(n_expert > 0);
+
+    // d(as) has as's shape: [n, m, n_expert].
+    const int64_t ne[4] = { b->ne[0], grad->ne[0], n_expert, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_OUT_PROD_ID_GRP;
+    result->src[0] = b;
+    result->src[1] = grad;
+    result->src[2] = ids;
 
     return result;
 }
@@ -3904,12 +4060,31 @@ struct ggml_tensor * ggml_get_rows_back(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         struct ggml_tensor  * c) {
-    GGML_ASSERT(ggml_is_matrix(a) && ggml_is_vector(b) && b->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_matrix(c) && (a->ne[0] == c->ne[0]));
+    // learning-llamas (S1-28): this used to require a MATRIX grad and a VECTOR index tensor --
+    //
+    //     GGML_ASSERT(ggml_is_matrix(a) && ggml_is_vector(b) && ...)
+    //
+    // -- while ggml_get_rows itself has always been fully general:
+    //
+    //     out[i0, i10, i11, i12] = a[i0, b[i10,i11,i12], i11, i12]
+    //
+    // So any get_rows with a 3D source and a 2D index tensor had a FORWARD but no backward, and
+    // aborted here. build_moe_ffn does exactly that -- it gathers each token's top-k router
+    // probabilities with
+    //
+    //     weights = get_rows(probs[1, n_expert, n_tok], selected_experts[n_used, n_tok])
+    //
+    // -- so no MoE model could train, whatever else was implemented. The assert fires in the graph
+    // BUILD, so it is a hard abort with no hint about the router.
+    //
+    // The gradient is a scatter-add back onto the gathered axis, and it is the same operation
+    // whatever the rank. dst takes c's shape, which is what the 2D case already produced.
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
+    GGML_ASSERT(a->ne[0] == c->ne[0]);
+    GGML_ASSERT(ggml_nelements(b) == a->ne[1]*a->ne[2]*a->ne[3]);
 
     // TODO: implement non F32 return
-    //struct ggml_tensor * result = ggml_new_tensor_2d(ctx, a->type, a->ne[0], b->ne[0]);
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1]);
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1], c->ne[2], c->ne[3]);
 
     result->op     = GGML_OP_GET_ROWS_BACK;
     result->src[0] = a;
@@ -5638,6 +5813,83 @@ struct ggml_tensor * ggml_ssm_scan(
     return result;
 }
 
+// ggml_ssm_conv_back / ggml_ssm_scan_back  (learning-llamas, S1-29b)
+
+struct ggml_tensor * ggml_ssm_conv_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * dy,
+        struct ggml_tensor  * sx,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(ggml_is_3d(sx));
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(dy->type == GGML_TYPE_F32);
+    GGML_ASSERT(sx->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type  == GGML_TYPE_F32);
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = sx->ne[0] - d_conv + 1;
+    const int64_t n_s     = sx->ne[2];
+
+    GGML_ASSERT(sx->ne[1] == d_inner);
+    GGML_ASSERT(dy->ne[0] == d_inner);
+    GGML_ASSERT(dy->ne[1] == n_t);
+    GGML_ASSERT(dy->ne[2] == n_s);
+
+    // d_sx has sx's shape, including the d_conv - 1 columns of leading state: those receive a
+    // gradient too (they are part of the convolution window), and dropping them would silently
+    // truncate the gradient at every sequence boundary.
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, sx->ne[0], sx->ne[1], sx->ne[2]);
+
+    result->op     = GGML_OP_SSM_CONV_BACK;
+    result->src[0] = dy;
+    result->src[1] = sx;
+    result->src[2] = c;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_ssm_scan_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * dt,
+        struct ggml_tensor  * A,
+        struct ggml_tensor  * B,
+        struct ggml_tensor  * C,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type  == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_are_same_shape(B, C));
+
+    // grad is the gradient of ssm_scan's PACKED dst: y, then the final states.
+    GGML_ASSERT(ggml_nelements(grad) ==
+        ggml_nelements(x) + s->ne[0]*s->ne[1]*s->ne[2]*ids->ne[0]);
+
+    // One op, five gradients. Packed in a fixed order, and the backward case views each region
+    // back onto its source -- the same trick ggml_ssm_scan itself uses for y + states.
+    const int64_t n_packed = ggml_nelements(s)
+                           + ggml_nelements(x)
+                           + ggml_nelements(dt)
+                           + ggml_nelements(B)
+                           + ggml_nelements(C);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_packed);
+
+    result->op     = GGML_OP_SSM_SCAN_BACK;
+    result->src[0] = grad;
+    result->src[1] = s;
+    result->src[2] = x;
+    result->src[3] = dt;
+    result->src[4] = A;
+    result->src[5] = B;
+    result->src[6] = C;
+    result->src[7] = ids;
+
+    return result;
+}
+
 // ggml_win_part
 
 struct ggml_tensor * ggml_win_part(
@@ -6593,7 +6845,26 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, grad, src1));
             }
             if (src1_needs_grads) {
-                ggml_sub_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1)));
+                // learning-llamas (S1-28): DIV's backward did not handle a BROADCAST src1, while
+                // MUL's -- six lines above -- always has.
+                //
+                // d/d(b) of (a/b) is -a/b^2 = -(a/b)/b, which has a's shape. When b is broadcast
+                // against a, that gradient has to be REDUCED back onto b's shape, exactly as MUL
+                // does. Without it the backward builder aborts on its own same-shape assert.
+                //
+                // This is not a corner case. build_moe_ffn normalizes the top-k router weights with
+                //
+                //     weights = div(weights, sum_rows(weights))     // [n_used, n_tok] / [1, n_tok]
+                //
+                // so EVERY MoE model with norm_w set -- which is every Mixtral -- hits it the moment
+                // a gradient reaches the router path. It is why no MoE could train even after
+                // MUL_MAT_ID had a backward, and it is invisible to test-backend-ops because
+                // test_bin_bcast never asks for a gradient.
+                struct ggml_tensor * tmp = ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1));
+                if (!ggml_are_same_shape(src0, src1)) {
+                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                }
+                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case GGML_OP_SQR: {
@@ -6738,6 +7009,40 @@ static void ggml_compute_backward(
                                 grad)));        // [m,p,qq,rr]
             }
         } break;
+        case GGML_OP_MUL_MAT_ID: {
+            // learning-llamas (S1-25). src0 = as [n,m,n_expert], src1 = b [n,ne_b1,n_tok],
+            // src2 = ids [n_ids,n_tok] I32. Forward:
+            //
+            //     dst[j,i,t] = sum_k as[k,j, ids[i,t]] * b[k, i % ne_b1, t]
+            //
+            // Both gradients are gather/scatter WITH ACCUMULATION, and neither is expressible in
+            // existing ops -- the expert axis is a selection, not a broadcast. See ggml_out_prod_id.
+            //
+            // src2 is I32 and so is skipped by the grad builder outright; there is nothing to
+            // ignore_src here.
+            //
+            // src0 needing grads is NOT an exotic case. build_lora_mm_id computes
+            // mul_mat_id(B, mul_mat_id(A, cur, ids), ids), which makes the trainable LoRA A and B
+            // the 3D expert operand -- so LoRA-only MoE training needs the WEIGHT-grad half too,
+            // and an "activations only" shortcut would silently train nothing.
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1,
+                        ggml_out_prod_id(ctx, src0, grad, src2, src1->ne[1]));
+            }
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0,
+                        ggml_out_prod_id_grp(ctx, src1, grad, src2, src0->ne[2]));
+            }
+        } break;
+        case GGML_OP_ADD_ID: {
+            // learning-llamas (S1-25). dst is a dup of src0 with a per-expert bias added, so
+            // src0's VJP is the identity. src1 is the bias TABLE -- a frozen base weight; training
+            // it needs a scatter-add and is deferred (ROADMAP E8 / B-09). src2 is I32.
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, grad);
+            }
+            GGML_ASSERT(!src1_needs_grads && "per-expert bias grads are not implemented (ROADMAP E8)");
+        } break;
         case GGML_OP_SCALE: {
             if (src0_needs_grads) {
                 float s;
@@ -6824,7 +7129,14 @@ static void ggml_compute_backward(
                     nb3 = (nb3 / n0) * ng;
                 }
 
-                ggml_acc_or_set(ctx, cgraph, isrc0, grad, nb1, nb2, nb3, offset);
+                // ggml_acc scatter-adds `grad` into src0's grad buffer, and its kernel reads the
+                // accumuland contiguously (asserts nb[0] == sizeof(float)). `grad` need not be
+                // contiguous: a view whose only consumer is a transpose gets a transposed (hence
+                // non-contiguous) gradient -- the Mamba conv does exactly this, splitting ssm_in's
+                // output with a view and feeding it through ggml_transpose (learning-llamas S1-47).
+                // Materialize it first, matching how the RESHAPE backward above already guards.
+                struct ggml_tensor * grad_acc = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+                ggml_acc_or_set(ctx, cgraph, isrc0, grad_acc, nb1, nb2, nb3, offset);
             }
         } break;
         case GGML_OP_PERMUTE: {
@@ -7066,19 +7378,151 @@ static void ggml_compute_backward(
             GGML_ASSERT(!src2_needs_grads && "cross_entropy_loss_sparse: weights are not differentiable");
         } break;
         case GGML_OP_GLU: {
-            switch (ggml_get_glu_op(tensor)) {
-                case GGML_GLU_OP_SWIGLU: {
-                    if (src0_needs_grads) {
-                        GGML_ASSERT(src1 && "backward pass only implemented for split swiglu");
-                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, ggml_mul(ctx, grad, src1), src0));
-                    }
-                    if (src1_needs_grads) {
-                        ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
-                    }
-                } break;
-                default: {
-                    GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
-                } //break;
+            const enum ggml_glu_op glu_op = ggml_get_glu_op(tensor);
+
+            // SPLIT SwiGLU keeps its existing SILU_BACK composite, untouched.
+            //
+            // That is the one path ggml could already differentiate, it is the FFN of every dense
+            // llama, and it is covered by the current MODE_GRAD sweep. Routing it through the new
+            // op would change nothing mathematically and risk a regression in the one place this
+            // project cannot afford one. Everything else -- FUSED SwiGLU (which used to trip
+            // `GGML_ASSERT(src1)`) and the whole REGLU / GEGLU / GEGLU_ERF / GEGLU_QUICK /
+            // SWIGLU_OAI family (which used to GGML_ABORT) -- goes through GLU_BACK (S1-28).
+            if (glu_op == GGML_GLU_OP_SWIGLU && src1) {
+                if (src0_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, ggml_mul(ctx, grad, src1), src0));
+                }
+                if (src1_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
+                }
+                break;
+            }
+
+            if (!src0_needs_grads && !src1_needs_grads) {
+                break;
+            }
+
+            const bool  swapped = ggml_get_op_params_i32(tensor, 1);
+            const float alpha   = ggml_get_op_params_f32(tensor, 2);
+            const float limit   = ggml_get_op_params_f32(tensor, 3);
+
+            // dst is always the FUSED shape [2*nc, ...], whichever way the forward packed itself.
+            struct ggml_tensor * gb = ggml_glu_back(ctx, grad, src0, src1, glu_op, swapped, alpha, limit);
+
+            if (src1) {
+                // Split: half 0 is d_a, half 1 is d_b. `swapped` is already honoured inside the
+                // kernel, so the halves come out in the caller's operand order and these views do
+                // not need to know about it.
+                const int64_t nc = grad->ne[0];
+
+                if (src0_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc0,
+                        ggml_cont(ctx, ggml_view_4d(ctx, gb, nc, gb->ne[1], gb->ne[2], gb->ne[3],
+                                                    gb->nb[1], gb->nb[2], gb->nb[3], 0)));
+                }
+                if (src1_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc1,
+                        ggml_cont(ctx, ggml_view_4d(ctx, gb, nc, gb->ne[1], gb->ne[2], gb->ne[3],
+                                                    gb->nb[1], gb->nb[2], gb->nb[3], nc*gb->nb[0])));
+                }
+            } else {
+                // Fused: dst IS d_a, both halves, in src0's own layout.
+                ggml_add_or_set(ctx, cgraph, isrc0, gb);
+            }
+        } break;
+        case GGML_OP_SSM_CONV: {
+            // learning-llamas (S1-29b). src0 = sx (the padded input window), src1 = c (the conv
+            // weight). Only sx takes a gradient: c is a frozen base weight on the LoRA path, and
+            // training it is ROADMAP E8.
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_ssm_conv_back(ctx, grad, src0, src1));
+            }
+            GGML_ASSERT(!src1_needs_grads && "SSM conv-weight gradients are not implemented (ROADMAP E8)");
+        } break;
+        case GGML_OP_SSM_SCAN: {
+            // learning-llamas (S1-29b). Seven sources: s, x, dt, A, B, C, ids.
+            //
+            // Five of them take a gradient, and one op cannot return five tensors -- so
+            // ggml_ssm_scan_back returns a PACKED 1-D tensor, exactly as ggml_ssm_scan itself packs
+            // y with the final states, and each region is viewed back onto its source here.
+            //
+            // A (the decay matrix) and ids (I32) do not. A is a frozen base weight on the LoRA
+            // path; asserting is better than silently producing nothing, because "the model trained
+            // but A never moved" is not a thing anyone would notice.
+            struct ggml_tensor * ssm_s  = tensor->src[0];
+            struct ggml_tensor * ssm_x  = tensor->src[1];
+            struct ggml_tensor * ssm_dt = tensor->src[2];
+            struct ggml_tensor * ssm_A  = tensor->src[3];
+            struct ggml_tensor * ssm_B  = tensor->src[4];
+            struct ggml_tensor * ssm_C  = tensor->src[5];
+            struct ggml_tensor * ssm_id = tensor->src[6];
+
+            const size_t issm_s  = ggml_hash_find(hash_set, ssm_s);
+            const size_t issm_x  = ggml_hash_find(hash_set, ssm_x);
+            const size_t issm_dt = ggml_hash_find(hash_set, ssm_dt);
+            const size_t issm_A  = ggml_hash_find(hash_set, ssm_A);
+            const size_t issm_B  = ggml_hash_find(hash_set, ssm_B);
+            const size_t issm_C  = ggml_hash_find(hash_set, ssm_C);
+
+            const bool need_s  = issm_s  != GGML_HASHSET_FULL && grads_needed[issm_s];
+            const bool need_x  = issm_x  != GGML_HASHSET_FULL && grads_needed[issm_x];
+            const bool need_dt = issm_dt != GGML_HASHSET_FULL && grads_needed[issm_dt];
+            const bool need_A  = issm_A  != GGML_HASHSET_FULL && grads_needed[issm_A];
+            const bool need_B  = issm_B  != GGML_HASHSET_FULL && grads_needed[issm_B];
+            const bool need_C  = issm_C  != GGML_HASHSET_FULL && grads_needed[issm_C];
+
+            GGML_ASSERT(!need_A && "SSM A-matrix gradients are not implemented (ROADMAP E8)");
+
+            if (need_s || need_x || need_dt || need_B || need_C) {
+                // n_group is ssm_B->ne[1]. The kernel routes each head to its group's B/C row via
+                // g = h/(nh/ng) and folds every head of a group back into one dB/dC slab (a GQA-
+                // style sum). B-10 gave that routing its finite-difference oracle -- tiny n_group in
+                // {2, 4} cases in test-backend-ops, both A branches, plus a float64 group-routing
+                // reference -- so n_group > 1 (Mamba-2 / Falcon-H1) is trained here now, where S1-47
+                // refused it for want of that oracle. The only shape the fold requires is that the
+                // heads divide evenly among the groups.
+                GGML_ASSERT(ssm_x->ne[1] % ssm_B->ne[1] == 0 &&
+                    "SSM_SCAN backward requires n_head to be a multiple of n_group");
+
+                struct ggml_tensor * gb = ggml_ssm_scan_back(
+                        ctx, grad, ssm_s, ssm_x, ssm_dt, ssm_A, ssm_B, ssm_C, ssm_id);
+
+                // Packed in this order: d_s | d_x | d_dt | d_B | d_C.
+                size_t off = 0;
+
+                if (need_s) {
+                    ggml_add_or_set(ctx, cgraph, issm_s,
+                        ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_view_1d(ctx, gb, ggml_nelements(ssm_s), off)),
+                                        ssm_s->ne[0], ssm_s->ne[1], ssm_s->ne[2], ssm_s->ne[3]));
+                }
+                off += ggml_nelements(ssm_s)*sizeof(float);
+
+                if (need_x) {
+                    ggml_add_or_set(ctx, cgraph, issm_x,
+                        ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_view_1d(ctx, gb, ggml_nelements(ssm_x), off)),
+                                        ssm_x->ne[0], ssm_x->ne[1], ssm_x->ne[2], ssm_x->ne[3]));
+                }
+                off += ggml_nelements(ssm_x)*sizeof(float);
+
+                if (need_dt) {
+                    ggml_add_or_set(ctx, cgraph, issm_dt,
+                        ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_view_1d(ctx, gb, ggml_nelements(ssm_dt), off)),
+                                        ssm_dt->ne[0], ssm_dt->ne[1], ssm_dt->ne[2], ssm_dt->ne[3]));
+                }
+                off += ggml_nelements(ssm_dt)*sizeof(float);
+
+                if (need_B) {
+                    ggml_add_or_set(ctx, cgraph, issm_B,
+                        ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_view_1d(ctx, gb, ggml_nelements(ssm_B), off)),
+                                        ssm_B->ne[0], ssm_B->ne[1], ssm_B->ne[2], ssm_B->ne[3]));
+                }
+                off += ggml_nelements(ssm_B)*sizeof(float);
+
+                if (need_C) {
+                    ggml_add_or_set(ctx, cgraph, issm_C,
+                        ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_view_1d(ctx, gb, ggml_nelements(ssm_C), off)),
+                                        ssm_C->ne[0], ssm_C->ne[1], ssm_C->ne[2], ssm_C->ne[3]));
+                }
             }
         } break;
         case GGML_OP_NONE: {

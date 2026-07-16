@@ -96,6 +96,7 @@ llama_context::llama_context(
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
     cparams.training                = false; // set by opt_init
+    cparams.attn_chunk_q            = 0;     // off; set by set_attn_chunk_q (S1-24)
 
     cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
     embd_layer_inp.resize(hparams.n_layer());
@@ -3277,6 +3278,10 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
 
 void llama_context::set_grad_checkpointing(uint32_t segment_len) {
     grad_ckpt_segment = segment_len;
+}
+
+void llama_context::set_attn_chunk_q(uint32_t chunk_q) {
+    cparams.attn_chunk_q = chunk_q;
 }
 
 // The layer boundaries of `gf`: the tensors gradient checkpointing keeps, and recomputes everything

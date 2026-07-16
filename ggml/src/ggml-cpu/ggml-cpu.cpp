@@ -467,6 +467,38 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                     ((ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
                      src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_OUT_PROD_ID_GRP:
+            // learning-llamas (S1-27): d(as). All three operands are F32 on the training path --
+            // b is activations, grad is a gradient, and the expert stack it feeds is the F32 LoRA
+            // A/B (base experts are frozen). A quantized `as` would need a dequantizing variant,
+            // and there is no caller for one.
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_SSM_CONV_BACK:
+            // learning-llamas (S1-30): d(sx) for the depthwise causal convolution. F32 throughout --
+            // the conv weight is F32 in every Mamba GGUF, and a gradient is F32 by policy.
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_SSM_SCAN_BACK:
+            // learning-llamas (S1-31): F32 throughout, like the forward.
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32;
+        case GGML_OP_GLU_BACK:
+            // learning-llamas (S1-28): F32 throughout. The GLU forwards accept F16, but a gradient
+            // is F32 on this project's training path by policy (ADR-0002), and there is no caller
+            // for an F16 variant.
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   (op->src[2] == NULL || op->src[2]->type == GGML_TYPE_F32) &&
+                   op->type == GGML_TYPE_F32;
+        case GGML_OP_OUT_PROD_ID:
+            // learning-llamas (S1-26): d(b). `as` may be QUANTIZED -- in a LoRA MoE graph the base
+            // expert stacks are frozen Q4_K, and the activations flowing into them still carry a
+            // gradient because an earlier layer's LoRA is upstream. Same dequantize-a-row-at-a-time
+            // path as OUT_PROD, and the same set of types.
+            return (src0->type == GGML_TYPE_F32 || ggml_is_quantized(src0->type) ||
+                    src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
+                   src1->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
+                   op->type == GGML_TYPE_F32;
         default:
             return true;
     }

@@ -280,6 +280,14 @@ struct llama_context {
     // the learning-llamas shim does, so that it can choose the loss -- still needs to set this.
     LLAMA_API_INTERNAL void set_training(bool value);
 
+    // Chunked attention (S1-24): split the query axis of the naive attention into chunks of
+    // `chunk_q` tokens, so only one chunk's [n_kv, chunk_q, n_head] matrix is live at a time.
+    // 0 = off, which is byte-for-byte the ordinary path.
+    //
+    // Pairs with set_grad_checkpointing, and needs it to shrink the BACKWARD -- see the note on
+    // cparams.attn_chunk_q. Ignored outside training: inference has no attention matrices to keep.
+    LLAMA_API_INTERNAL void set_attn_chunk_q(uint32_t chunk_q);
+
     // 0 = off. See set_grad_checkpointing.
     uint32_t grad_ckpt_segment = 0;
 

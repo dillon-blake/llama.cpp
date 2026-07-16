@@ -13,6 +13,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -2478,6 +2479,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
+    // Kept for S1-24's chunked path, which slices the token axis BEFORE the permute. Slicing
+    // AFTER it would take a view of a permuted (non-contiguous) tensor, and ggml's autodiff does
+    // not survive that: the gradient comes back through PERMUTE as a non-contiguous view and then
+    // hits `ggml_scale`'s `GGML_ASSERT(ggml_is_padded_1d(a))` in the LoRA scale's backward. Here
+    // the token axis is ne[2] and rows are contiguous, so the slice is an ordinary view and the
+    // backward chain is the same shape the naive path already proves works.
+    ggml_tensor * const q_bhd = q;
+
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
@@ -2526,6 +2535,132 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    } else if (cparams.attn_chunk_q > 0 && cparams.training) {
+        // CHUNKED ATTENTION (learning-llamas S1-24).
+        //
+        // The attention matrix is [n_kv, n_q, n_head] -- quadratic in context, and the reason
+        // long-context training runs out of memory. Splitting the QUERY axis and softmaxing each
+        // chunk on its own leaves only [n_kv, chunk_q, n_head] live at a time. Every op below
+        // already exists on every backend: this is a graph rewrite, not a kernel.
+        //
+        // Softmax is row-wise over the KEY axis, so chunking the QUERY axis is exact -- each
+        // output row depends on its own row of scores and nothing else. Chunking the KEY axis
+        // would not be: that needs the running-max/running-sum rescale of flash attention, which
+        // is what FA5-FA7 are for. This is the kernel-free fallback until they land.
+        //
+        // The memory win on the FORWARD is immediate. On the BACKWARD it needs gradient
+        // checkpointing (S1-17), and the reason is worth spelling out: SOFT_MAX_BACK reads the
+        // softmax's own OUTPUT, so without recompute every chunk's P stays live from the forward
+        // until the backward consumes it, and the peak is unchanged -- chunking alone buys
+        // nothing. Under ggml_build_backward_expand_checkpointed each P_c is a segment-interior
+        // node, rebuilt immediately ahead of the backward node that reads it and dead again
+        // straight after. The two are multiplicative.
+        //
+        // Only in training. Inference keeps no attention matrix alive, so there is nothing to win
+        // and the concat would be pure cost.
+        // q_bhd is [head_dim, n_head, n_tokens, n_stream] -- the token axis is ne[2] and has not
+        // been permuted yet. Slice THERE, then permute the slice. Slicing the permuted q instead
+        // takes a view of a non-contiguous tensor, and the backward dies in ggml_scale's
+        // is_padded_1d assert (see the note at q_bhd).
+        const int64_t n_q = q_bhd->ne[2];
+        const int64_t chunk = std::min<int64_t>(cparams.attn_chunk_q, n_q);
+
+        // v is transposed ONCE, outside the loop: it is shared by every chunk, and transposing it
+        // per chunk would allocate n_chunks copies of exactly the thing we are trying to save.
+        if (!v_trans) {
+            v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+            cb(v, "v_cont", il);
+        }
+
+        std::vector<ggml_tensor *> parts;
+
+        for (int64_t i0 = 0; i0 < n_q; i0 += chunk) {
+            const int64_t len = std::min<int64_t>(chunk, n_q - i0);
+
+            ggml_tensor * q_c = ggml_view_4d(ctx0, q_bhd,
+                    q_bhd->ne[0], q_bhd->ne[1], len, q_bhd->ne[3],
+                    q_bhd->nb[1], q_bhd->nb[2], q_bhd->nb[3], i0*q_bhd->nb[2]);
+
+            q_c = ggml_permute(ctx0, q_c, 0, 2, 1, 3);   // -> [head_dim, len, n_head, n_stream]
+
+            // The mask's rows are the QUERY rows, so it is sliced the same way. Its ne[1] is
+            // padded up (GGML_KQ_MASK_PAD) and is therefore >= n_q; taking `len` rows from i0 is
+            // in range for every chunk.
+            ggml_tensor * mask_c = kq_mask ? ggml_view_4d(ctx0, kq_mask,
+                    kq_mask->ne[0], len, kq_mask->ne[2], kq_mask->ne[3],
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i0*kq_mask->nb[1]) : nullptr;
+
+            ggml_tensor * kq_c = ggml_mul_mat(ctx0, k, q_c);
+            ggml_mul_mat_set_prec(kq_c, GGML_PREC_F32);
+            cb(kq_c, "kq", il);
+
+            if (arch == LLM_ARCH_GROK) {
+                kq_c = ggml_tanh(ctx0, ggml_scale(ctx0, kq_c, hparams.f_attn_out_scale / hparams.f_attn_logit_softcapping));
+                kq_c = ggml_scale(ctx0, kq_c, hparams.f_attn_logit_softcapping);
+            }
+
+            if (hparams.attn_soft_cap) {
+                kq_c = ggml_scale(ctx0, kq_c, 1.0f / hparams.f_attn_logit_softcapping);
+                kq_c = ggml_tanh (ctx0, kq_c);
+                kq_c = ggml_scale(ctx0, kq_c, hparams.f_attn_logit_softcapping);
+            }
+
+            if (kq_b) {
+                // kq_b is [n_kv, n_q, ...] like kq, so it slices along the same axis.
+                kq_c = ggml_add(ctx0, kq_c, ggml_view_4d(ctx0, kq_b,
+                        kq_b->ne[0], len, kq_b->ne[2], kq_b->ne[3],
+                        kq_b->nb[1], kq_b->nb[2], kq_b->nb[3], i0*kq_b->nb[1]));
+            }
+
+            // ALiBi's slope is a function of the HEAD index, not the token index, so slicing the
+            // query axis leaves it untouched. Same for the sinks, which are per-head.
+            kq_c = ggml_soft_max_ext(ctx0, kq_c, mask_c, kq_scale, hparams.f_max_alibi_bias);
+            ggml_soft_max_add_sinks(kq_c, sinks);
+            cb(kq_c, "kq_soft_max", il);
+
+            ggml_tensor * kqv_c = ggml_mul_mat(ctx0, v, kq_c);
+            cb(kqv_c, "kqv", il);
+
+            parts.push_back(kqv_c);
+        }
+
+        // Reassemble the token axis with a BALANCED concat tree, not a left fold.
+        //
+        // A left fold (acc = concat(acc, next)) builds accumulators of size 1/C, 2/C, ... C/C of
+        // the output, and their gradients likewise -- so the concat machinery costs O(C) times the
+        // output and the memory saved by a smaller chunk is handed straight back. It is measurable:
+        // with a fold, peak memory bottomed out at 4 chunks and got WORSE from there, which is the
+        // opposite of the point of the feature.
+        //
+        // A balanced tree has log2(C) levels, each totalling one output, and only ~2 levels are
+        // ever live. CONCAT's VJP landed in S1-29, which is what makes any of this differentiable
+        // without a new kernel.
+        while (parts.size() > 1) {
+            std::vector<ggml_tensor *> next;
+            next.reserve((parts.size() + 1)/2);
+
+            for (size_t i = 0; i + 1 < parts.size(); i += 2) {
+                next.push_back(ggml_concat(ctx0, parts[i], parts[i + 1], 1));
+            }
+            if (parts.size() % 2) {
+                next.push_back(parts.back());
+            }
+            parts = std::move(next);
+        }
+
+        ggml_tensor * kqv = parts[0];
+
+        if (v_mla) {
+            kqv = ggml_mul_mat(ctx0, v_mla, kqv);
+            cb(kqv, "kqv_mla", il);
+        }
+
+        cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+        cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+        if (!cparams.offload_kqv) {
+            ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+        }
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);

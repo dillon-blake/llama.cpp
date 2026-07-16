@@ -4512,6 +4512,422 @@ void ggml_compute_forward_out_prod(
     }
 }
 
+// ggml_compute_forward_out_prod_id_grp  (learning-llamas, S1-27)
+//
+// The WEIGHT half of MUL_MAT_ID's backward: d(as).
+//
+//   forward   dst[j,i,t] = sum_k as[k,j, ids[i,t]] * b[k, i % ne_b1, t]
+//   this op   d_as[k,j,e] = sum_{(i,t) : ids[i,t] == e}  b[k, i % ne_b1, t] * grad[j,i,t]
+//
+//   src0 = b     [n,  ne_b1, n_tok]   activations
+//   src1 = grad  [m,  n_ids, n_tok]   incoming gradient
+//   src2 = ids   [n_ids, n_tok]  I32  which expert each (slot, token) routed to
+//   dst          [n,  m,     n_expert]
+//
+// "grp" is for GROUPED: it reduces over every (slot, token) that routed to a given expert. That
+// reduction is the whole difficulty. An expert chosen by many tokens accumulates all of them, and
+// a token may route to several experts -- so this is a scatter-add, not a permutation.
+//
+// It is threaded BY EXPERT, and that is deliberate rather than incidental: each expert's output
+// slice is written by exactly one thread, so the accumulation needs no atomics and no reduction
+// barrier, and the summation order within a slice is fixed by the (t, i) loop rather than by which
+// thread got there first. Determinism is a hard requirement on a gradient path (ADR-0002) -- a
+// float sum whose order depends on thread scheduling makes a training run unreproducible, and it
+// does so silently.
+//
+// Experts with no tokens routed to them are not skipped: their slice is still zeroed, because it
+// is a gradient and the optimizer will read it whether or not anything routed there this step.
+static void ggml_compute_forward_out_prod_id_grp_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];  // b
+    const ggml_tensor * src1 = dst->src[1];  // grad
+    const ggml_tensor * src2 = dst->src[2];  // ids
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    // b is the VECTOR operand of ggml_vec_mad_f32, so its dim-0 has to be contiguous -- a strided
+    // read is not merely wrong here, it is unrepresentable. src1 (grad) and src2 (ids) are read
+    // element-by-element through their strides instead, and must NOT be asserted contiguous: ggml
+    // hands this op transposed grads, and the forward accepts strided ids.
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n        = src0->ne[0];  // b's row length  == dst->ne[0]
+    const int64_t ne_b1    = src0->ne[1];  // b's broadcast dim
+    const int64_t n_tok    = src0->ne[2];
+    const int64_t m        = src1->ne[0];  // grad's row length == dst->ne[1]
+    const int64_t n_ids    = src1->ne[1];
+    const int64_t n_expert = dst->ne[2];
+
+    GGML_ASSERT(dst->ne[0] == n);
+    GGML_ASSERT(dst->ne[1] == m);
+    GGML_ASSERT(src1->ne[2] == n_tok);
+    GGML_ASSERT(src2->ne[0] == n_ids);
+    GGML_ASSERT(src2->ne[1] == n_tok);
+    GGML_ASSERT(n_ids % ne_b1 == 0);
+
+    for (int64_t e = ith; e < n_expert; e += nth) {
+        float * d_e = (float *) ((char *) dst->data + e*dst->nb[2]);
+
+        // Zero this expert's whole slice first -- including the experts nothing routes to.
+        for (int64_t j = 0; j < m; ++j) {
+            ggml_vec_set_f32(n, (float *) ((char *) d_e + j*dst->nb[1]), 0.0f);
+        }
+
+        for (int64_t t = 0; t < n_tok; ++t) {
+            const char * ids_t = (const char *) src2->data + t*src2->nb[1];
+
+            for (int64_t i = 0; i < n_ids; ++i) {
+                // ids is read through nb[0], NOT as int32_t*[i]. The FORWARD reads it that way
+                // (ggml_compute_forward_mul_mat_id: `*(int32_t *)(ids->data + iid1*nb[1] + id*nb[0])`)
+                // and ggml_mul_mat_id puts no contiguity constraint on ids -- so a strided ids is a
+                // legal tensor that the forward computes CORRECTLY. A hard-coded 4-byte stride here
+                // would make the backward disagree with the forward about which expert each slot
+                // chose, and credit the wrong experts. Silently.
+                const int32_t e_i = *(const int32_t *) (ids_t + i*src2->nb[0]);
+                if (e_i != (int32_t) e) {
+                    continue;
+                }
+
+                // The forward broadcasts b's columns across slots when ne_b1 < n_ids, so slot i
+                // reads column i % ne_b1 -- and the gradient must gather from the same column.
+                const float * b_col = (const float *) ((const char *) src0->data
+                                        + (i % ne_b1)*src0->nb[1] + t*src0->nb[2]);
+                const char * g_col = (const char *) src1->data
+                                        + i*src1->nb[1] + t*src1->nb[2];
+
+                // d_as[:, j, e] += grad[j,i,t] * b_col[:]
+                for (int64_t j = 0; j < m; ++j) {
+                    // grad is read through nb[0] too, and this is not paranoia: ggml's autodiff
+                    // hands transposed grads to out-prod-shaped ops as a matter of course. The
+                    // MUL_MAT backward passes ggml_transpose(grad) to ggml_out_prod, which is why
+                    // ggml_compute_forward_out_prod_f32 reads src1 through `i1*nb10` rather than
+                    // indexing a float*. This kernel is modelled on that one and had dropped it.
+                    //
+                    // A TRANSPOSE node reaching here has nb[0] == 8, and a float*[j] read of it
+                    // silently returns the wrong element. No assert fires; the run just trains on a
+                    // wrong weight gradient.
+                    const float gj = *(const float *) (g_col + j*src1->nb[0]);
+                    ggml_vec_mad_f32(n, (float *) ((char *) d_e + j*dst->nb[1]), b_col, gj);
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_out_prod_id_grp(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    ggml_compute_forward_out_prod_id_grp_f32(params, dst);
+}
+
+// ggml_compute_forward_out_prod_id  (learning-llamas, S1-26)
+//
+// The ACTIVATION half of MUL_MAT_ID's backward: d(b).
+//
+//   forward   dst[j,i,t] = sum_k as[k,j, ids[i,t]] * b[k, i % ne_b1, t]
+//   this op   d_b[k,l,t] = sum_{i : i % ne_b1 == l} sum_j as[k,j, ids[i,t]] * grad[j,i,t]
+//
+//   src0 = as    [n, m, n_expert]     the expert stack -- and this one may be QUANTIZED
+//   src1 = grad  [m, n_ids, n_tok]
+//   src2 = ids   [n_ids, n_tok] I32
+//   dst          [n, ne_b1, n_tok]
+//
+// `as` being quantized is the whole difficulty, and it is not a corner case. In a LoRA MoE graph
+// the base expert stacks (ffn_up_exps and friends) are frozen Q4_K -- they receive no gradient
+// themselves, but the activations flowing INTO them do, because an earlier layer's LoRA is
+// upstream. So d(b) has to propagate back through a quantized weight, exactly as OUT_PROD does
+// for the dense case: dequantize one row of `as` at a time into a per-thread F32 buffer and
+// accumulate in F32. Accumulation stays F32 on a gradient path, per ADR-0002.
+//
+// Threaded BY TOKEN. Each token owns its own dst columns, so -- as in OUT_PROD_ID_GRP -- there is
+// exactly one writer per output element, no atomics, no barrier, and the summation order within a
+// token is fixed by the (slot, row) loops rather than by thread arrival. Note the slots of one
+// token can share a dst column (that is precisely what ne_b1 == 1 means, and it is what
+// build_moe_ffn produces), so this accumulation is real and its order matters.
+static void ggml_compute_forward_out_prod_id_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];  // as
+    const ggml_tensor * src1 = dst->src[1];  // grad
+    const ggml_tensor * src2 = dst->src[2];  // ids
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const ggml_type type = src0->type;
+    ggml_to_float_t const to_float = ggml_get_type_traits(type)->to_float;
+
+    const bool as_is_f32 = (type == GGML_TYPE_F32);
+    GGML_ASSERT(as_is_f32 || to_float != NULL);
+
+    // A row of `as` must be contiguous for a single to_float call to make sense.
+    GGML_ASSERT(src0->nb[0] == ggml_type_size(type));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n        = src0->ne[0];  // == dst->ne[0]
+    const int64_t m        = src0->ne[1];  // == grad->ne[0]
+    const int64_t n_expert = src0->ne[2];
+    const int64_t ne_b1    = dst->ne[1];
+    const int64_t n_tok    = dst->ne[2];
+    const int64_t n_ids    = src2->ne[0];
+
+    GGML_ASSERT(src1->ne[0] == m);
+    GGML_ASSERT(src1->ne[1] == n_ids);
+    GGML_ASSERT(src1->ne[2] == n_tok);
+    GGML_ASSERT(src2->ne[1] == n_tok);
+    GGML_ASSERT(n_ids % ne_b1 == 0);
+
+    // One dequantized row per thread. Sized in ggml_graph_plan -- miss it and this writes past the
+    // end of the work buffer, which is the kind of bug that shows up as a corrupted tensor three
+    // ops downstream.
+    float * wdata = (float *) params->wdata + (n + CACHE_LINE_SIZE_F32) * ith;
+
+    for (int64_t t = ith; t < n_tok; t += nth) {
+        // Zero this token's columns. Slots that route nowhere still need a defined gradient.
+        for (int64_t l = 0; l < ne_b1; ++l) {
+            ggml_vec_set_f32(n, (float *) ((char *) dst->data + l*dst->nb[1] + t*dst->nb[2]), 0.0f);
+        }
+
+        const char * ids_t = (const char *) src2->data + t*src2->nb[1];
+
+        for (int64_t i = 0; i < n_ids; ++i) {
+            // ids and grad are both read through nb[0] -- see the long comment in
+            // ggml_compute_forward_out_prod_id_grp_f32. The forward reads ids strided, and ggml's
+            // autodiff routinely produces transposed grads; a hard-coded 4-byte stride on either
+            // is a silent wrong answer, not a crash.
+            const int32_t e = *(const int32_t *) (ids_t + i*src2->nb[0]);
+            GGML_ASSERT(e >= 0 && e < n_expert);
+
+            // The forward broadcasts b's column across slots when ne_b1 < n_ids, so several slots
+            // of this token accumulate into the SAME dst column. That is the ne_b1 == 1 case.
+            float * d_col = (float *) ((char *) dst->data + (i % ne_b1)*dst->nb[1] + t*dst->nb[2]);
+            const char * g_col = (const char *) src1->data + i*src1->nb[1] + t*src1->nb[2];
+
+            for (int64_t j = 0; j < m; ++j) {
+                const char * as_row = (const char *) src0->data + j*src0->nb[1] + e*src0->nb[2];
+
+                const float * a;
+                if (as_is_f32) {
+                    a = (const float *) as_row;
+                } else {
+                    to_float((const void *) as_row, wdata, n);
+                    a = wdata;
+                }
+
+                const float gj = *(const float *) (g_col + j*src1->nb[0]);
+                ggml_vec_mad_f32(n, d_col, a, gj);
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_out_prod_id(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    ggml_compute_forward_out_prod_id_f32(params, dst);
+}
+
+// ggml_compute_forward_glu_back  (learning-llamas, S1-28)
+//
+// Every GLU is `y = act(x) * g`, so every GLU's VJP is the same two lines:
+//
+//     dx = dy * g * act'(x)
+//     dg = dy * act(x)
+//
+// and the only thing that varies across the family is act and act'. Writing them out rather than
+// composing them out of existing ops is what makes GEGLU_ERF possible at all -- ggml has no erf op,
+// so `gelu_erf'` is not expressible as a graph.
+//
+// The derivatives, against ggml's OWN scalar forwards in vec.h (not against a paper -- if ggml's
+// gelu uses the tanh approximation then its derivative must be the derivative OF THAT, or the
+// finite difference will disagree and be right to):
+//
+//   silu(x)       = x*s,            s = sigmoid(x)
+//   silu'(x)      = s * (1 + x*(1 - s))
+//   gelu(x)       = 0.5x(1 + T),    u = SQRT_2_OVER_PI*x*(1 + A*x*x),  T = tanh(u),  A = 0.044715
+//   gelu'(x)      = 0.5(1 + T) + 0.5x(1 - T*T) * SQRT_2_OVER_PI*(1 + 3*A*x*x)
+//   gelu_erf(x)   = 0.5x(1 + erf(x/sqrt2))
+//   gelu_erf'(x)  = 0.5(1 + erf(x/sqrt2)) + x * exp(-x*x/2)/sqrt(2*pi)
+//   gelu_quick(x) = x*q,            q = sigmoid(-GELU_QUICK_COEF * x)   [COEF is -1.702]
+//   gelu_quick'(x)= q + x*(-GELU_QUICK_COEF)*q*(1 - q)
+//   reglu(x)      = relu(x);        reglu'(x) = step(x)         [0 at the kink, as ggml_step does]
+//
+// SWIGLU_OAI is the awkward one, because it clamps BOTH halves:
+//
+//   x' = min(x, limit)
+//   y' = clamp(g, -limit, limit)
+//   out = x' * sigmoid(alpha*x') * (y' + 1)
+//
+//   d(out)/dx = [x < limit]        * (s + alpha*x'*s*(1 - s)) * (y' + 1),   s = sigmoid(alpha*x')
+//   d(out)/dg = [|g| < limit]      * x' * s
+//
+// The indicators are ZERO at the clamp bounds -- the same subgradient convention as the landed
+// CLAMP VJP (S1-19) and as ggml_step at 0. That is a real discontinuity, not a rounding artifact,
+// and a finite difference straddling a bound will disagree with it. The grad test narrows its
+// input range so the bounds are not straddled; see test_swiglu_oai.
+static void ggml_compute_forward_glu_back_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * grad = dst->src[0];  // dy, forward-output shape [nc, ...]
+    const ggml_tensor * src0 = dst->src[1];  // a
+    const ggml_tensor * src1 = dst->src[2];  // b, or NULL when fused
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+    if (src1) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+    }
+
+    const enum ggml_glu_op op      = (enum ggml_glu_op) ggml_get_op_params_i32(dst, 0);
+    const bool             swapped = (bool)             ggml_get_op_params_i32(dst, 1);
+    const float            alpha   =                    ggml_get_op_params_f32(dst, 2);
+    const float            limit   =                    ggml_get_op_params_f32(dst, 3);
+
+    const int64_t nc = grad->ne[0];          // the forward's output width
+    const int64_t nr = ggml_nrows(grad);
+
+    GGML_ASSERT(dst->ne[0] == (src1 ? 2*nc : src0->ne[0]));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Row-parallel: each row is written by exactly one thread, so no atomics and no barrier, and
+    // the arithmetic within a row is a fixed sequence. Deterministic by construction (ADR-0002).
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t r = ir0; r < ir1; ++r) {
+        // grad is read through nb[0], NOT indexed as a float*.
+        //
+        // ggml's autodiff hands backward ops TRANSPOSED grads as a matter of course -- the MUL_MAT
+        // backward passes ggml_transpose(grad) straight to ggml_out_prod with no ggml_cont. A
+        // TRANSPOSE node has nb[0] != 4, and a float*[k] read of it silently returns the wrong
+        // element: no assert, no crash, just a wrong gradient. This is the exact bug an adversarial
+        // review found in the S1-26/S1-27 MoE kernels, and this kernel had it too. Verified: the
+        // same logical grad in two memory layouts used to disagree by 1.30.
+        //
+        // src0/src1/dst keep their contiguity asserts -- their rows are walked as float arrays and
+        // a strided read there is unrepresentable, not merely wrong.
+        const char * dy_row = (const char *) grad->data + r*grad->nb[1];
+
+        // Where the two halves live, and where their gradients go. For a fused input both halves
+        // sit in src0 and `swapped` says which is the gate; for a split input they are src0 and
+        // src1 and `swapped` does not apply to the operands at all.
+        const float * xp;   // gate half   (the one act() is applied to)
+        const float * gp;   // linear half
+        float * dxp;        // d(gate)
+        float * dgp;        // d(linear)
+
+        float * d0 = (float *) ((char *) dst->data + r*dst->nb[1]);
+
+        // An odd-width fused `a` has a trailing element the forward never reads (ggml_glu halves
+        // the width with integer division). Its gradient is zero -- but it must be WRITTEN zero,
+        // not left as whatever the allocator handed us.
+        for (int64_t k = 2*nc; k < dst->ne[0]; ++k) {
+            d0[k] = 0.0f;
+        }
+
+        if (src1) {
+            xp  = (const float *) ((const char *) src0->data + r*src0->nb[1]);
+            gp  = (const float *) ((const char *) src1->data + r*src1->nb[1]);
+            dxp = d0;        // half 0 of dst -> d_a
+            dgp = d0 + nc;   // half 1 of dst -> d_b
+        } else {
+            const float * a0 = (const float *) ((const char *) src0->data + r*src0->nb[1]);
+            xp  = a0 + (swapped ? nc : 0);
+            gp  = a0 + (swapped ? 0  : nc);
+            // dst mirrors src0's own layout, so the gradients land back where the halves came from.
+            dxp = d0 + (swapped ? nc : 0);
+            dgp = d0 + (swapped ? 0  : nc);
+        }
+
+        for (int64_t k = 0; k < nc; ++k) {
+            const float x  = xp[k];
+            const float g  = gp[k];
+            const float dy_k = *(const float *) (dy_row + k*grad->nb[0]);
+
+            float act;    // act(x)
+            float dact;   // act'(x)
+
+            switch (op) {
+                case GGML_GLU_OP_REGLU: {
+                    act  = x > 0.0f ? x : 0.0f;
+                    dact = x > 0.0f ? 1.0f : 0.0f;
+                } break;
+                case GGML_GLU_OP_SWIGLU: {
+                    const float s = 1.0f/(1.0f + expf(-x));
+                    act  = x*s;
+                    dact = s*(1.0f + x*(1.0f - s));
+                } break;
+                case GGML_GLU_OP_GEGLU: {
+                    const float x2 = x*x;
+                    const float u  = SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x2);
+                    const float t  = tanhf(u);
+                    act  = 0.5f*x*(1.0f + t);
+                    dact = 0.5f*(1.0f + t) +
+                           0.5f*x*(1.0f - t*t)*SQRT_2_OVER_PI*(1.0f + 3.0f*GELU_COEF_A*x2);
+                } break;
+                case GGML_GLU_OP_GEGLU_ERF: {
+                    const float e = erff(x*SQRT_2_INV);
+                    act  = 0.5f*x*(1.0f + e);
+                    // phi(x) = exp(-x^2/2)/sqrt(2*pi);  1/sqrt(2*pi) == SQRT_2_OVER_PI * 0.5
+                    dact = 0.5f*(1.0f + e) + x*expf(-0.5f*x*x)*(0.5f*SQRT_2_OVER_PI);
+                } break;
+                case GGML_GLU_OP_GEGLU_QUICK: {
+                    const float q = 1.0f/(1.0f + expf(GELU_QUICK_COEF*x));
+                    act  = x*q;
+                    dact = q + x*(-GELU_QUICK_COEF)*q*(1.0f - q);
+                } break;
+                case GGML_GLU_OP_SWIGLU_OAI: {
+                    const float xc = MIN(x, limit);
+                    const float gc = MAX(MIN(g, limit), -limit);
+                    const float s  = 1.0f/(1.0f + expf(alpha*(-xc)));
+
+                    // out = xc*s*(gc + 1). Both clamps contribute a zero subgradient at the bound.
+                    const float dout_dxc = s + alpha*xc*s*(1.0f - s);
+
+                    dxp[k] = (x < limit)                 ? dy_k*dout_dxc*(gc + 1.0f) : 0.0f;
+                    dgp[k] = (g > -limit && g < limit)   ? dy_k*xc*s                 : 0.0f;
+                    continue;  // SWIGLU_OAI does not fit the act/act' shape: it clamps g too.
+                }
+                default: {
+                    GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(op));
+                }
+            }
+
+            dxp[k] = dy_k * g * dact;
+            dgp[k] = dy_k * act;
+        }
+    }
+}
+
+void ggml_compute_forward_glu_back(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    ggml_compute_forward_glu_back_f32(params, dst);
+}
+
 // ggml_compute_forward_scale
 
 static void ggml_compute_forward_scale_f32(
@@ -5190,19 +5606,38 @@ static void ggml_compute_forward_get_rows_back_f32(
 
     memset(dst->data, 0, ggml_nbytes(dst));
 
-    const int nc = src0->ne[0];
-    const int nr = ggml_nelements(src1);
+    const int64_t nc = src0->ne[0];
 
     GGML_ASSERT( dst->ne[0] == nc);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
 
-    for (int i = 0; i < nr; ++i) {
-        const int r = ((int32_t *) src1->data)[i];
+    // learning-llamas (S1-28): the general form, matching ggml_get_rows' own semantics
+    //
+    //     out[i0, i10, i11, i12] = a[i0, b[i10,i11,i12], i11, i12]
+    //
+    // so the gradient scatter-adds back along the gathered axis:
+    //
+    //     d_a[i0, b[i10,i11,i12], i11, i12] += grad[i0, i10, i11, i12]
+    //
+    // This used to be written for a 1-D index tensor only, which meant a 3D get_rows had a forward
+    // and no backward -- and build_moe_ffn's router-weight gather is exactly a 3D get_rows, so no
+    // MoE model could train. The old 2-D loop is the i11 == i12 == 0 slice of this one.
+    for (int64_t i12 = 0; i12 < src1->ne[2]; ++i12) {
+        for (int64_t i11 = 0; i11 < src1->ne[1]; ++i11) {
+            for (int64_t i10 = 0; i10 < src1->ne[0]; ++i10) {
+                const int64_t r = *(const int32_t *) ((const char *) src1->data
+                                    + i10*src1->nb[0] + i11*src1->nb[1] + i12*src1->nb[2]);
 
-        ggml_vec_add_f32(nc,
-                (float *) ((char *)  dst->data + r*dst->nb[1]),
-                (float *) ((char *)  dst->data + r*dst->nb[1]),
-                (float *) ((char *) src0->data + i*src0->nb[1]));
+                GGML_ASSERT(r >= 0 && r < dst->ne[1]);
+
+                float * d = (float *) ((char *) dst->data
+                                + r*dst->nb[1] + i11*dst->nb[2] + i12*dst->nb[3]);
+                const float * g = (const float *) ((const char *) src0->data
+                                + i10*src0->nb[1] + i11*src0->nb[2] + i12*src0->nb[3]);
+
+                ggml_vec_add_f32(nc, d, d, g);
+            }
+        }
     }
 }
 
@@ -5609,10 +6044,31 @@ static void ggml_compute_forward_soft_max_ext_back_f32(
         // linear runtime, no additional memory
         float dot_y_dy = 0;
         ggml_vec_dot_f32  (nc, &dot_y_dy, 0, y, 0, dy, 0, 1);
-        ggml_vec_cpy_f32  (nc, dx, dy);
-        ggml_vec_acc1_f32 (nc, dx, -dot_y_dy);
-        ggml_vec_mul_f32  (nc, dx, dx, y);
-        ggml_vec_scale_f32(nc, dx, scale);
+
+        // learning-llamas (S1-41): compute dx = scale * y * (dy - <y,dy>) ELEMENT-WISE, not with
+        // the cpy/acc/mul vector sequence this used to run. The trap is an in-place ALIAS the
+        // ordinary graph never hits but the MoE router backward does.
+        //
+        // GGML_OP_SOFT_MAX_BACK is on ggml_op_can_inplace's list (ggml-alloc.c), so ggml-gallocr may
+        // put dst on top of a src buffer. It walks src[0] (grad, = dy) first, then src[1] (the
+        // softmax OUTPUT, = y), and reuses the first whose only remaining consumer is this node.
+        // For attention, y is also read by the V matmul's backward, so it is never that lone
+        // consumer and dst never lands on it. For a Mixtral router, y feeds only argsort (no grad)
+        // and get_rows (which reads the ids, not y) -- so at backward time THIS op is y's sole
+        // consumer, and gallocr aliases dst onto y.
+        //
+        // The old sequence was safe against dst==dy (cpy is then a no-op) but NOT against dst==y:
+        // `cpy(dx,dy)` overwrote the whole y buffer, then `mul(dx,dx,y)` read that clobbered y and
+        // produced ~(dy - <y,dy>)^2 instead of y*(dy - <y,dy>). d_logits collapsed toward zero, the
+        // router weights got no gradient, and every LoRA upstream of an MoE block trained on a dh
+        // that silently dropped its router term. The forward, the loss, and the expert-weight grads
+        // all stayed correct, which is why it hid.
+        //
+        // Reading y[i] and dy[i] before writing dx[i], with <y,dy> already reduced, is correct
+        // whether dst aliases y, aliases dy, or aliases neither -- and it is one pass, not four.
+        for (int i = 0; i < nc; ++i) {
+            dx[i] = scale * y[i] * (dy[i] - dot_y_dy);
+        }
 
 #ifndef NDEBUG
         for (int i = 0; i < nc; ++i) {
@@ -9511,6 +9967,90 @@ void ggml_compute_forward_flash_attn_back(
 
 // ggml_compute_forward_ssm_conv
 
+// ggml_compute_forward_ssm_conv_back  (learning-llamas, S1-30)
+//
+// The forward is a depthwise causal convolution over a sliding window:
+//
+//     y[i1, i2, i3] = sum_{i0 < d_conv}  sx[i2 + i0, i1, i3] * c[i0, i1]
+//
+// so the gradient w.r.t. the window SCATTERS each output's gradient back across the d_conv inputs
+// that produced it:
+//
+//     d_sx[i2 + i0, i1, i3] += dy[i1, i2, i3] * c[i0, i1]
+//
+// Written as a scatter rather than the equivalent gather (`d_sx[j] = sum over t of dy[t]*c[j-t]`,
+// with its two-sided bounds on t) because the scatter needs no boundary arithmetic at all: every
+// (i2, i0) pair lands in range by construction. The leading d_conv - 1 columns of sx are the
+// carried convolution state, and they receive a gradient like any other input -- dropping them
+// would silently truncate the gradient at every sequence boundary.
+//
+// Threaded by (row, sequence): each (i1, i3) owns its own d_sx column, so there are no atomics, no
+// barrier, and the accumulation order within a column is fixed by the i2/i0 loops rather than by
+// thread arrival. Deterministic by construction (ADR-0002).
+static void ggml_compute_forward_ssm_conv_back_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];  // dy [d_inner, n_t, n_s]
+    const ggml_tensor * src1 = dst->src[1];  // sx -- shape only
+    const ggml_tensor * src2 = dst->src[2];  // c  [d_conv, d_inner]
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+    GGML_ASSERT(src2->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nc      = src2->ne[0];   // d_conv
+    const int64_t ncs     = src1->ne[0];   // d_conv - 1 + n_t
+    const int64_t d_inner = src1->ne[1];
+    const int64_t n_t     = src0->ne[1];
+    const int64_t n_s     = src1->ne[2];
+
+    GGML_ASSERT(dst->ne[0] == ncs);
+    GGML_ASSERT(dst->ne[1] == d_inner);
+    GGML_ASSERT(dst->ne[2] == n_s);
+    GGML_ASSERT(src0->ne[0] == d_inner);
+    GGML_ASSERT(src0->ne[2] == n_s);
+    GGML_ASSERT(src2->ne[1] == d_inner);
+    GGML_ASSERT(ncs == nc - 1 + n_t);
+
+    // rows per thread, over d_inner
+    const int64_t dr  = (d_inner + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, d_inner);
+
+    for (int64_t i3 = 0; i3 < n_s; ++i3) {
+        for (int64_t i1 = ir0; i1 < ir1; ++i1) {
+            float * d = (float *) ((char *) dst->data + i1*dst->nb[1] + i3*dst->nb[2]);
+
+            // Zeroed here, not by a memset over the whole tensor: each thread owns exactly the
+            // columns it is about to write, so no barrier is needed between the clear and the
+            // accumulate.
+            ggml_vec_set_f32(ncs, d, 0.0f);
+
+            const float * c = (const float *) ((const char *) src2->data + i1*src2->nb[1]);
+
+            for (int64_t i2 = 0; i2 < n_t; ++i2) {
+                const float g = *(const float *) ((const char *) src0->data
+                                    + i1*src0->nb[0] + i2*src0->nb[1] + i3*src0->nb[2]);
+
+                // d[i2 .. i2 + nc) += g * c[0 .. nc)
+                ggml_vec_mad_f32(nc, d + i2, c, g);
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_ssm_conv_back(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    ggml_compute_forward_ssm_conv_back_f32(params, dst);
+}
+
 static void ggml_compute_forward_ssm_conv_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -9577,6 +10117,230 @@ void ggml_compute_forward_ssm_conv(
                 GGML_ABORT("fatal error");
             }
     }
+}
+
+// ggml_compute_forward_ssm_scan_back  (learning-llamas, S1-31)
+//
+// The forward, per sequence i3, head h, dim i1 (ii = i1 + h*nr), state i0:
+//
+//     dt_sp = softplus(dt[h,t])
+//     dA    = exp(dt_sp * A[h])            (Mamba-2: one scalar per head)
+//           = exp(dt_sp * A[i0,h])         (Mamba-1: one per state)
+//     s_t[i0,ii] = s_{t-1}[i0,ii]*dA + B[i0,g,t] * (x[ii,t]*dt_sp)
+//     y[ii,t]    = sum_i0 s_t[i0,ii] * C[i0,g,t]
+//
+// so the backward is a REVERSE recurrence. Walking t from n_t-1 down to 0, carrying `ds` = the
+// gradient of the state *entering* token t+1:
+//
+//     dS[i0,ii]   = ds[i0,ii] + dy[ii,t]*C[i0,g,t]      this token's own output wants the state too
+//     dC[i0,g,t] += s_t[i0,ii] * dy[ii,t]               summed over the heads in group g
+//     dB[i0,g,t] += dS[i0,ii] * x_dt                    likewise
+//     dx[ii,t]    = dt_sp * sum_i0 dS[i0,ii]*B[i0,g,t]
+//     d(dt_sp)   += x[ii,t]*sum_i0 dS*B  +  sum_i0 dS * s_{t-1} * A * dA
+//     ds[i0,ii]   = dS[i0,ii] * dA                      handed to token t-1
+//     ddt[h,t]    = d(dt_sp) * sigmoid(dt[h,t])         softplus' IS the sigmoid
+//
+// TWO THINGS THAT ARE EASY TO GET WRONG, AND BOTH ARE SILENT.
+//
+// 1. `grad` is the WHOLE packed gradient of ssm_scan's dst -- y AND the final states -- and the
+//    state region is NOT zero. MODE_GRAD's objective sums over the packed dst, so
+//    d(sum)/d(s_final) is 1, and a kernel that seeded `ds` with zeros would disagree with the
+//    finite difference and be WRONG TO. It seeds the reverse recurrence at t = n_t.
+//
+//    In training that region genuinely is zero -- the cached state feeds nothing downstream of the
+//    loss -- so honouring it costs nothing there, and it makes cross-ubatch BPTT nearly free later.
+//
+// 2. The forward OVERWRITES the state in place (`s0 = s` each token), so s_{t-1} is gone by the
+//    time the backward needs it -- and it does need it, for d(dt) via the dA path. So the states
+//    are recomputed and STORED, all n_t + 1 of them. That is the store-all strategy: correct,
+//    O(n_t) memory, and the honest starting point for a CPU oracle. Checkpoint-every-K is the
+//    optimization, and it has to be pinned bit-for-bit against this.
+//
+// Threaded by SEQUENCE, not by head -- deliberately. dB and dC accumulate over every head in a
+// group, so a head-partitioned kernel would have several threads writing the same (i0, g, t) and
+// would need atomics: neither deterministic nor free. One thread per sequence owns every output it
+// touches. Parallelism is therefore n_seqs, which is small -- and correctness and determinism
+// (ADR-0002) come first in the kernel the GPU ports will be measured against.
+static void ggml_compute_forward_ssm_scan_back_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * grad = dst->src[0];
+    const ggml_tensor * src0 = dst->src[1];  // s   {d_state, dim, n_head, n_slots}
+    const ggml_tensor * src1 = dst->src[2];  // x   {dim, n_head, n_t, n_s}
+    const ggml_tensor * src2 = dst->src[3];  // dt  {n_head, n_t, n_s}
+    const ggml_tensor * src3 = dst->src[4];  // A   {d_state, n_head} or {1, n_head}
+    const ggml_tensor * src4 = dst->src[5];  // B   {d_state, n_group, n_t, n_s}
+    const ggml_tensor * src5 = dst->src[6];  // C   {d_state, n_group, n_t, n_s}
+    const ggml_tensor * src6 = dst->src[7];  // ids {n_s}
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+    GGML_ASSERT(src2->nb[0] == sizeof(float));
+    GGML_ASSERT(src3->nb[0] == sizeof(float));
+    GGML_ASSERT(src4->nb[0] == sizeof(float));
+    GGML_ASSERT(src5->nb[0] == sizeof(float));
+    GGML_ASSERT(src6->nb[0] == sizeof(int32_t));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nc = src0->ne[0];  // d_state
+    const int64_t nr = src0->ne[1];  // head_dim
+    const int64_t nh = src1->ne[1];  // n_head
+    const int64_t ng = src4->ne[1];  // n_group
+    const int64_t nt = src1->ne[2];  // tokens per sequence
+    const int64_t ns = src1->ne[3];  // sequences
+
+    GGML_ASSERT(nh % ng == 0);
+
+    const int64_t s_off = ggml_nelements(src1) * ggml_element_size(src1);  // size of the y region
+
+    // The packed dst: [ d_s | d_x | d_dt | d_B | d_C ]
+    const int64_t n_s_el  = ggml_nelements(src0);
+    const int64_t n_x_el  = ggml_nelements(src1);
+    const int64_t n_dt_el = ggml_nelements(src2);
+    const int64_t n_B_el  = ggml_nelements(src4);
+
+    float * d_s  = (float *) dst->data;
+    float * d_x  = d_s  + n_s_el;
+    float * d_dt = d_x  + n_x_el;
+    float * d_B  = d_dt + n_dt_el;
+    float * d_C  = d_B  + n_B_el;
+
+    // Zeroed once, before anyone accumulates. d_s has one slot per STATE SLOT, and a slot no
+    // sequence maps to has to come out zero rather than uninitialized.
+    if (ith == 0) {
+        ggml_vec_set_f32(ggml_nelements(dst), (float *) dst->data, 0.0f);
+    }
+    ggml_barrier(params->threadpool);
+
+    // Per-thread scratch: n_t + 1 stored states, plus one slot for the running ds.
+    const int64_t state_sz = nc*nr*nh;
+    float * scratch = (float *) params->wdata + (size_t) ith*state_sz*(nt + 2);
+    float * states  = scratch;
+    float * ds      = scratch + (nt + 1)*state_sz;
+
+    const int32_t * ids = (const int32_t *) src6->data;
+
+    const bool scalar_A = (src3->ne[0] == 1);
+    const float * A = (const float *) src3->data;
+
+    for (int64_t i3 = ith; i3 < ns; i3 += nth) {
+        // ---- forward recompute, storing every state --------------------------------------------
+        {
+            const float * s0 = (const float *) ((const char *) src0->data + ids[i3]*src0->nb[3]);
+            memcpy(states, s0, state_sz*sizeof(float));
+
+            for (int64_t i2 = 0; i2 < nt; ++i2) {
+                const float * x  = (const float *) ((const char *) src1->data + i2*src1->nb[2] + i3*src1->nb[3]);
+                const float * dt = (const float *) ((const char *) src2->data + i2*src2->nb[1] + i3*src2->nb[2]);
+                const float * B  = (const float *) ((const char *) src4->data + i2*src4->nb[2] + i3*src4->nb[3]);
+
+                const float * sp = states + i2*state_sz;        // s_{t-1}
+                float       * sn = states + (i2 + 1)*state_sz;  // s_t
+
+                for (int64_t h = 0; h < nh; ++h) {
+                    const float dt_sp = ggml_compute_softplus_f32(dt[h]);
+                    const int64_t g   = h / (nh / ng);
+
+                    for (int64_t i1 = 0; i1 < nr; ++i1) {
+                        const int64_t ii   = i1 + h*nr;
+                        const float   x_dt = x[ii] * dt_sp;
+
+                        for (int64_t i0 = 0; i0 < nc; ++i0) {
+                            const float a  = scalar_A ? A[h] : A[i0 + h*nc];
+                            const float dA = expf(dt_sp * a);
+
+                            sn[i0 + ii*nc] = sp[i0 + ii*nc]*dA + B[i0 + g*nc]*x_dt;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- reverse pass -----------------------------------------------------------------------
+
+        // Seeded from grad's STATE region, not from zero. See note 1 above.
+        {
+            const float * gs = (const float *) ((const char *) grad->data + s_off + i3*src0->nb[3]);
+            memcpy(ds, gs, state_sz*sizeof(float));
+        }
+
+        for (int64_t i2 = nt - 1; i2 >= 0; --i2) {
+            const float * x  = (const float *) ((const char *) src1->data + i2*src1->nb[2] + i3*src1->nb[3]);
+            const float * dt = (const float *) ((const char *) src2->data + i2*src2->nb[1] + i3*src2->nb[2]);
+            const float * B  = (const float *) ((const char *) src4->data + i2*src4->nb[2] + i3*src4->nb[3]);
+            const float * C  = (const float *) ((const char *) src5->data + i2*src5->nb[2] + i3*src5->nb[3]);
+
+            const float * dy = (const float *) ((const char *) grad->data
+                                 + i2*(nh*nr*sizeof(float)) + i3*(nt*nh*nr*sizeof(float)));
+
+            const float * sp = states + i2*state_sz;        // s_{t-1}
+            const float * sn = states + (i2 + 1)*state_sz;  // s_t
+
+            float * dxt  = d_x  + i2*(nh*nr) + i3*(nt*nh*nr);
+            float * ddtt = d_dt + i2*nh      + i3*(nt*nh);
+            float * dBt  = d_B  + i2*(nc*ng) + i3*(nt*nc*ng);
+            float * dCt  = d_C  + i2*(nc*ng) + i3*(nt*nc*ng);
+
+            for (int64_t h = 0; h < nh; ++h) {
+                const float dt_raw = dt[h];
+                const float dt_sp  = ggml_compute_softplus_f32(dt_raw);
+                const float sig    = 1.0f/(1.0f + expf(-dt_raw));   // softplus'(dt) is the sigmoid
+                const int64_t g    = h / (nh / ng);
+
+                float d_dt_sp = 0.0f;
+
+                for (int64_t i1 = 0; i1 < nr; ++i1) {
+                    const int64_t ii   = i1 + h*nr;
+                    const float   x_dt = x[ii] * dt_sp;
+                    const float   gy   = dy[ii];
+
+                    float dot_B = 0.0f;   // sum_i0  dS * B
+                    float dot_A = 0.0f;   // sum_i0  dS * s_{t-1} * A * dA     (the dA path)
+
+                    for (int64_t i0 = 0; i0 < nc; ++i0) {
+                        const float a  = scalar_A ? A[h] : A[i0 + h*nc];
+                        const float dA = expf(dt_sp * a);
+
+                        // The state's total gradient: what the later tokens sent back, plus what
+                        // this token's own output wants of it.
+                        const float dS = ds[i0 + ii*nc] + gy*C[i0 + g*nc];
+
+                        dCt[i0 + g*nc] += sn[i0 + ii*nc] * gy;
+                        dBt[i0 + g*nc] += dS * x_dt;
+
+                        dot_B += dS * B[i0 + g*nc];
+                        dot_A += dS * sp[i0 + ii*nc] * a * dA;
+
+                        // Hand the state gradient back one token. Overwriting ds in place is safe:
+                        // nothing later in this iteration reads the old value.
+                        ds[i0 + ii*nc] = dS * dA;
+                    }
+
+                    dxt[ii]  = dt_sp * dot_B;
+                    d_dt_sp += x[ii]*dot_B + dot_A;
+                }
+
+                ddtt[h] = d_dt_sp * sig;
+            }
+        }
+
+        // Whatever gradient is left in ds after t = 0 belongs to the INITIAL state.
+        float * d_s_i3 = d_s + ids[i3]*state_sz;
+        for (int64_t k = 0; k < state_sz; ++k) {
+            d_s_i3[k] += ds[k];
+        }
+    }
+}
+
+void ggml_compute_forward_ssm_scan_back(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    ggml_compute_forward_ssm_scan_back_f32(params, dst);
 }
 
 // ggml_compute_forward_ssm_scan

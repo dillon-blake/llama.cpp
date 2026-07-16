@@ -592,6 +592,18 @@ extern "C" {
         GGML_OP_CROSS_ENTROPY_LOSS_SPARSE,
         GGML_OP_CROSS_ENTROPY_LOSS_SPARSE_BACK,
 
+        // learning-llamas: the two halves of MUL_MAT_ID's backward (S1-25). Also at the TAIL,
+        // for the same reason as above.
+        GGML_OP_OUT_PROD_ID,
+        GGML_OP_OUT_PROD_ID_GRP,
+
+        // learning-llamas: the VJP for every GLU variant ggml could not differentiate (S1-28).
+        GGML_OP_GLU_BACK,
+
+        // learning-llamas: the state-space VJPs (S1-29b wiring, S1-30/S1-31 kernels).
+        GGML_OP_SSM_CONV_BACK,
+        GGML_OP_SSM_SCAN_BACK,
+
         GGML_OP_COUNT,
     };
 
@@ -1333,6 +1345,27 @@ extern "C" {
              struct ggml_tensor * b,
              enum ggml_glu_op     op);
 
+    // learning-llamas (S1-28): the VJP of any GLU.
+    //
+    // ggml could differentiate exactly one member of the GLU family -- SPLIT SwiGLU -- via a
+    // SILU_BACK composite. Fused SwiGLU tripped an assert, and REGLU / GEGLU / GEGLU_ERF /
+    // GEGLU_QUICK / SWIGLU_OAI hit `GGML_ABORT("unsupported glu op for backward pass")`. So every
+    // Gemma (GEGLU) and gpt-oss (SWIGLU_OAI) model was untrainable.
+    //
+    // `grad` has the FORWARD'S output shape [nc, ...]. dst always has the FUSED shape [2*nc, ...]:
+    //   - fused input  -> dst IS d_a, both halves, honouring `swapped`
+    //   - split input  -> the caller views half 0 as d_a and half 1 as d_b
+    // One op, one kernel, one row pass, whichever way the caller packed its operands.
+    GGML_API struct ggml_tensor * ggml_glu_back(
+            struct ggml_context * ctx,
+             struct ggml_tensor * grad,
+             struct ggml_tensor * a,
+             struct ggml_tensor * b,      // NULL for the fused form
+             enum ggml_glu_op     op,
+             bool                 swapped,
+             float                alpha,  // SWIGLU_OAI only
+             float                limit); // SWIGLU_OAI only
+
     GGML_API struct ggml_tensor * ggml_reglu_split(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1453,6 +1486,40 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // learning-llamas (S1-25): the two halves of MUL_MAT_ID's backward.
+    //
+    // For the forward  dst[j,i,t] = sum_k as[k,j, ids[i,t]] * b[k, i % ne_b1, t]:
+    //
+    //   ggml_out_prod_id     -> d(b)  [n, ne_b1, n_tokens]  : gather the expert matrix each
+    //                           (i,t) slot used and push the gradient back through it. Slots
+    //                           sharing a b column (the ne_b1 == 1 case, which is what
+    //                           build_moe_ffn produces) ACCUMULATE into it.
+    //
+    //   ggml_out_prod_id_grp -> d(as) [n, m, n_expert]      : the outer product b (x) grad,
+    //                           scattered into the expert slice each (i,t) selected, and
+    //                           accumulated -- an expert chosen by many tokens sums them all.
+    //
+    // "grp" is for grouped: it reduces over every (i,t) that routed to a given expert. The
+    // weight-grad half is NOT optional for LoRA-only MoE training, which is the discovery this
+    // ticket turns on: build_lora_mm_id makes the trainable A/B tensors the 3D expert operand
+    // of mul_mat_id itself, so they are `as`, not activations.
+    // ne_b1 is b's middle dim. It cannot be recovered from as/grad/ids -- the forward broadcasts
+    // b's columns across slots whenever ids->ne[0] is a multiple of it -- so it is passed, not
+    // assumed to be 1.
+    GGML_API struct ggml_tensor * ggml_out_prod_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * ids,
+            int64_t               ne_b1);
+
+    GGML_API struct ggml_tensor * ggml_out_prod_id_grp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * ids,
+            int64_t               n_expert);
 
     //
     // operations on tensors without backpropagation
@@ -2449,8 +2516,50 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // learning-llamas (S1-29b): d(sx) for ggml_ssm_conv.
+    //
+    // The forward is a depthwise causal convolution:
+    //
+    //     y[i1, t, i3] = sum_{i0 < d_conv}  sx[t + i0, i1, i3] * c[i0, i1]
+    //
+    // so the gradient w.r.t. the input window is the same convolution run backwards:
+    //
+    //     d_sx[j, i1, i3] = sum_{t : 0 <= j - t < d_conv, 0 <= t < n_t}  dy[i1, t, i3] * c[j - t, i1]
+    //
+    // dst has sx's shape. The conv weight `c` is a frozen base weight on this project's LoRA path
+    // and takes no gradient (ROADMAP E8); the backward case asserts rather than silently skipping.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * dy,   // [d_inner, n_t, n_s]
+            struct ggml_tensor  * sx,   // for the output shape
+            struct ggml_tensor  * c);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * A,
+            struct ggml_tensor  * B,
+            struct ggml_tensor  * C,
+            struct ggml_tensor  * ids);
+
+    // learning-llamas (S1-29b): the VJP of the selective scan.
+    //
+    // ggml_ssm_scan returns a PACKED 1-D dst -- `y` concatenated with the final states -- and so
+    // does this: one op cannot return five tensors, so the backward packs
+    //
+    //     [ d_s | d_x | d_dt | d_B | d_C ]
+    //
+    // and the backward case views each region back onto its source. `grad` is the WHOLE packed
+    // gradient of the forward's dst, state region included: MODE_GRAD's objective sums over it, so
+    // it is NOT zero there, and a kernel that assumed otherwise would disagree with the finite
+    // difference and be wrong to. The state-grad region seeds the reverse recurrence at t = n_t.
+    //
+    // A (the decay matrix) and ids (I32) take no gradient here.
+    GGML_API struct ggml_tensor * ggml_ssm_scan_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad,  // the packed gradient of ssm_scan's dst
             struct ggml_tensor  * s,
             struct ggml_tensor  * x,
             struct ggml_tensor  * dt,

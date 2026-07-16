@@ -1845,6 +1845,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_out_prod(params, tensor);
             } break;
+        case GGML_OP_OUT_PROD_ID_GRP:
+            {
+                ggml_compute_forward_out_prod_id_grp(params, tensor);
+            } break;
+        case GGML_OP_OUT_PROD_ID:
+            {
+                ggml_compute_forward_out_prod_id(params, tensor);
+            } break;
+        case GGML_OP_GLU_BACK:
+            {
+                ggml_compute_forward_glu_back(params, tensor);
+            } break;
         case GGML_OP_SCALE:
             {
                 ggml_compute_forward_scale(params, tensor);
@@ -2012,9 +2024,17 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ssm_conv(params, tensor);
             } break;
+        case GGML_OP_SSM_CONV_BACK:
+            {
+                ggml_compute_forward_ssm_conv_back(params, tensor);
+            } break;
         case GGML_OP_SSM_SCAN:
             {
                 ggml_compute_forward_ssm_scan(params, tensor);
+            } break;
+        case GGML_OP_SSM_SCAN_BACK:
+            {
+                ggml_compute_forward_ssm_scan_back(params, tensor);
             } break;
         case GGML_OP_WIN_PART:
             {
@@ -2321,6 +2341,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
+        case GGML_OP_OUT_PROD_ID_GRP:
+        case GGML_OP_OUT_PROD_ID:
+        case GGML_OP_GLU_BACK:
             {
                 n_tasks = n_threads;
             } break;
@@ -2389,7 +2412,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_CONV_BACK:
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_SSM_SCAN_BACK:
             {
                 n_tasks = n_threads;
             } break;
@@ -2874,6 +2899,31 @@ struct ggml_cplan ggml_graph_plan(
                             node->src[0]->type == GGML_TYPE_BF16) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
+                    } break;
+                case GGML_OP_SSM_SCAN_BACK:
+                    {
+                        // learning-llamas (S1-31): the forward overwrites its state in place, so
+                        // the backward recomputes and STORES every intermediate state -- n_t + 1 of
+                        // them -- plus one slot for the running state-gradient. Per thread, because
+                        // each thread owns whole sequences.
+                        const struct ggml_tensor * s  = node->src[1];
+                        const struct ggml_tensor * x  = node->src[2];
+                        const int64_t state_sz = s->ne[0]*s->ne[1]*x->ne[1];
+                        const int64_t n_t      = x->ne[2];
+                        cur = ggml_type_size(GGML_TYPE_F32) * state_sz * (n_t + 2) * n_tasks;
+                    } break;
+                case GGML_OP_OUT_PROD_ID:
+                    {
+                        // learning-llamas (S1-26): d(b) propagates back through the base expert
+                        // stack, which in a LoRA MoE graph is frozen and QUANTIZED. The kernel
+                        // dequantizes one row of `as` at a time into a per-thread F32 buffer.
+                        //
+                        // Sized unconditionally, not just for quantized `as`. The buffer costs one
+                        // row per thread, and making it conditional means a later change to the
+                        // kernel's fast path silently overruns the work buffer -- which surfaces as
+                        // a corrupted tensor several ops downstream, not as a crash here.
+                        cur = ggml_type_size(GGML_TYPE_F32) *
+                              (node->src[0]->ne[0] + CACHE_LINE_SIZE/sizeof(float)) * n_tasks;
                     } break;
                 case GGML_OP_SOFT_MAX:
                 case GGML_OP_ROPE:

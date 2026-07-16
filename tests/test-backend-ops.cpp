@@ -51,10 +51,45 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+// GGML_TEST_SEED makes tensor initialization reproducible run to run (S1-50). Unset (the default)
+// returns -1 and every init site keeps its std::random_device behavior, so nothing changes unless a
+// caller explicitly asks for a seed. The env is read exactly once.
+static int64_t test_backend_ops_seed() {
+    static const int64_t seed = []() -> int64_t {
+        const char * env = getenv("GGML_TEST_SEED");
+        return (env && *env) ? (int64_t) strtoll(env, nullptr, 10) : -1;
+    }();
+    return seed;
+}
+
+// A fresh RNG for one tensor-init site. When GGML_TEST_SEED is set, each site gets its OWN
+// repeatable stream (the base seed mixed with a monotone counter) so distinct sites do not collide
+// or all emit the same values; when unset, it is std::random_device exactly as before. The counter
+// is mutex-guarded because init sites can run from worker threads.
+static std::mt19937 test_backend_ops_rng() {
+    const int64_t seed = test_backend_ops_seed();
+    if (seed < 0) {
+        std::random_device rd;
+        return std::mt19937(rd());
+    }
+    static std::mutex mtx;
+    static uint64_t counter = 0;
+    std::lock_guard<std::mutex> lock(mtx);
+    return std::mt19937((uint32_t) ((uint64_t) seed + 0x9E3779B9ull * (counter++)));
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
-    {
+    if (test_backend_ops_seed() >= 0) {
+        // Deterministic single-threaded fill: the value SEQUENCE must not depend on how the range
+        // was split across worker threads, or the seed would not actually pin the inputs.
+        std::mt19937 gen = test_backend_ops_rng();
+        std::uniform_real_distribution<float> distribution(min, max);
+        for (size_t i = 0; i < nels; i++) {
+            data[i] = distribution(gen);
+        }
+    } else {
         // parallel initialization
         static const size_t n_threads = N_THREADS;
 
@@ -152,8 +187,7 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     std::vector<float>       data_f32(ne0*ne1*ne2*ne3);
     std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen = test_backend_ops_rng();
     std::uniform_real_distribution<float> dis(min, max);
 
     for (size_t i = 0; i < data_f32.size(); i++) {
@@ -168,12 +202,12 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     const int n_inf_zero_blocks = 0.2*(ne0*ne1*ne2*ne3)/(blck0*blck1);
 
     for (int b = 0; b < n_inf_zero_blocks; b++) {
-        const int p3 = (rd() % ne3);
-        const int p2 = (rd() % ne2);
-        const int p1 = (rd() % ne1);
-        const int p0 = (rd() % ne0);
+        const int p3 = (gen() % ne3);
+        const int p2 = (gen() % ne2);
+        const int p1 = (gen() % ne1);
+        const int p0 = (gen() % ne0);
 
-        bool inf = rd() & 1;
+        bool inf = gen() & 1;
 
         for (int i1 = 0; i1 < blck1 && p1 + i1 < ne1; i1++) {
             const int idx = p3*ne2*ne1*ne0 + p2*ne1*ne0 + (p1 + i1)*ne0 + p0;
@@ -199,8 +233,7 @@ static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max 
 
     std::vector<float> data_f32(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen = test_backend_ops_rng();
     std::uniform_real_distribution<float> dis(min, max);
 
     for (int64_t i3 = 0; i3 < ne3; i3++) {
@@ -336,10 +369,44 @@ static double mean_abs_asymm(const float * a, const float * b, const size_t n, c
             }
         }
 
-        const float asymm = (a[i] - b[i]) / (a[i] + b[i]);
+        // learning-llamas (S1-37): the denominator is |a| + |b|, NOT a + b.
+        //
+        // Two bugs, and they compound.
+        //
+        // 1. Dividing by the SIGNED sum sends the ratio to infinity whenever the two gradients
+        //    nearly cancel -- and in particular whenever the TRUE gradient is near zero and both
+        //    are rounding noise. That is not exotic: any op whose output is a product has such
+        //    elements for ordinary inputs (every GLU: dx = dy * g * act'(x)), and any op that sums
+        //    over a selected subset can manufacture them (MUL_MAT_ID's expert routing). Measured on
+        //    GLU_BACK, with the kernel verified exact against a float64 reference throughout, the
+        //    "noise" reached MAA 1.80 while a genuinely broken kernel measures 0.18-0.60. The noise
+        //    OVERLAPS the defects, and because the metric is unbounded, NO tolerance is safe.
+        //
+        // 2. a == b == 0 gives 0/0 = NaN. `NaN > max_maa_err()` is FALSE, so the case PASSES
+        //    UNCONDITIONALLY. tanh(150) and sigmoid(150) are 1.0 to float precision -- derivative
+        //    exactly zero -- and test_unary initializes in [-150, 150]. TANH and SIGMOID have been
+        //    on the vendor-bump allowlist since S1-19 on the strength of a NaN. So has
+        //    CROSS_ENTROPY_LOSS, whose softmax is one-hot at [-100, 100].
+        //
+        // |a| + |b| >= |a + b| always, so this can only make MAA smaller; it is bounded in [-1, 1],
+        // which is what a symmetric relative error is meant to be. Noise floor on GLU drops from
+        // 1.80 to 0.022, and every injected defect is caught with 3.6-12x margin.
+        const float denom = fabsf(a[i]) + fabsf(b[i]);
+        const float asymm = denom > 0.0f ? (a[i] - b[i]) / denom : 0.0f;
 
         sum += fabsf(asymm);
         nvalid++;
+    }
+
+    // nvalid == 0 means the grad_expect filter (or an empty tensor) discarded EVERY element, so
+    // this metric compared nothing. sum/nvalid is then 0.0/0 = NaN, and `NaN > max_maa_err()` is
+    // false, so the case would PASS having verified no gradient at all -- the same free-pass class
+    // S1-37 closed for the per-element 0/0. Reachable for CLAMP: if a finite-difference estimate
+    // straddles a bound, its value matches neither expected 0 nor 1 and is filtered out; do that to
+    // all of them and the grad check is vacuous. Return +inf so the case FAILS loudly instead
+    // (an infinite MAA is the visible "compared nothing" signal).
+    if (nvalid == 0) {
+        return INFINITY;
     }
 
     return sum/nvalid;
@@ -2098,13 +2165,57 @@ struct test_unary : public test_case {
             max =  10.f;
         }
 
+        // learning-llamas (S1-37): the SATURATING unaries need a conditioned range for MODE_GRAD.
+        //
+        // tanh(150) and sigmoid(150) are 1.0 to float precision, so their derivatives are EXACTLY
+        // zero -- and until the mean_abs_asymm fix, an exactly-zero gradient pair gave 0/0 = NaN,
+        // `NaN > tolerance` is false, and the case passed UNCONDITIONALLY. TANH and SIGMOID have
+        // been on the vendor-bump allowlist since S1-19 on exactly that basis.
+        //
+        // With the metric corrected they are checked for the first time, and at +-150 they fail on
+        // rounding noise in the saturated tails (MAA 0.14 and 0.37) while the kernels are fine: a
+        // grad_eps of 15 against a range of 150 measures nothing a derivative would recognise.
+        //
+        // So MODE_GRAD gets a range where the derivative is not flat, and a step that fits inside
+        // it. The EVAL sweep keeps +-150: it is hunting NaNs in the tails, which is the opposite
+        // requirement.
+        const bool saturating = (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_SIGMOID);
+        if (mode == MODE_GRAD && saturating) {
+            min = -3.0f;
+            max =  3.0f;
+        }
+
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             // test extended range of values to check for NaNs in GELU
             init_tensor_uniform(t, min, max);
         }
     }
 
+    // MEASURED (S1-37). Once the saturating ops are conditioned, the residual is finite-difference
+    // rounding and nothing else:
+    //
+    //   TANH     worst FD noise, 6 runs   5.5e-4
+    //   SIGMOID  worst FD noise, 6 runs   1.1e-2   (sigmoid' peaks at 0.25, so its gradient is
+    //                                               small and the relative metric is harsher)
+    //   a VJP scaled by 2                 0.33     (an identity-scaled error has asymm exactly 1/3)
+    //
+    // These bounds sit above the noise and ~7-600x below a real defect. Before S1-37 these two ops
+    // were passing on a NaN and their gradients were never compared at all.
+    double max_maa_err() override {
+        if (op == GGML_UNARY_OP_SIGMOID) {
+            return 5e-2;
+        }
+        if (op == GGML_UNARY_OP_TANH) {
+            return 5e-3;
+        }
+        return 1e-4;
+    }
+
     float grad_eps() override {
+        // A step of 15 inside a +-3 range would jump clean over the region being measured.
+        if (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_SIGMOID) {
+            return 0.02f;
+        }
         return 15.0f;
     }
 
@@ -2142,18 +2253,84 @@ struct test_glu : public test_case {
             bool swapped = false)
         : op(op), type(type), ne_a(ne_a), v(v), swapped(swapped) {}
 
+    // MEASURED, and its LIMITS stated -- because this bound is loose and pretending otherwise
+    // would be worse than the bound itself.
+    //
+    //   worst FD noise, 5+ runs, all variants        0.038 - 0.10
+    //   drop act'(x) from dx                         0.53
+    //   drop act(x)  from dg                         0.39
+    //   use act(x) where g belongs in dx             4.51
+    //   GEGLU_QUICK: drop the second derivative term 2.16
+    //   SWIGLU_OAI:  drop the (y+1) factor           3.64
+    //
+    // 0.15 catches every STRUCTURAL defect by 2.6-30x. It does NOT catch a subtle one: perturbing
+    // GEGLU's tanh argument by 5% measures 0.062, which is inside the noise. So MODE_GRAD is a
+    // wiring check for this op, not a numerics check, and it is important to say so.
+    //
+    // WHY THE NOISE IS IRREDUCIBLE. dx = dy * g * act'(x), and `g` is uniformly initialized, so
+    // elements with g ~ 0 exist at ANY range -- and mean_abs_asymm divides by (gn + ga), not by
+    // (|gn| + |ga|), so a near-zero gradient sends that ratio to infinity. Narrowing the init range
+    // does not help (measured at +/-4, +/-2 and +/-1.5: 0.038, 0.10, 0.031). Unlike MUL_MAT_ID,
+    // this op cannot be conditioned out of it: the gradient is elementwise, so there are no extra
+    // terms to sum over.
+    //
+    // The derivatives themselves are therefore checked against a DOUBLE-PRECISION reference of
+    // ggml's own scalar forwards -- exactly, to ~1e-7 -- rather than through this metric. That is
+    // the oracle that would catch a wrong coefficient; this one would not.
+    // MEASURED (S1-28 + S1-37), with numbers on both sides:
+    //
+    //   worst FD noise, 15 runs                0.022
+    //   drop act'(x) from dx                   0.52
+    //   drop act(x)  from dg                   0.59
+    //   use act(x) where g belongs in dx       4.51
+    //   GEGLU_QUICK: drop the 2nd deriv term   0.54
+    //   SWIGLU_OAI:  drop the (y+1) factor     0.60
+    //   SWIGLU:      drop the x(1-s) term      0.18
+    //
+    // 5e-2 sits 2.3x above the noise and 3.6-90x below every real defect. Six mutations injected,
+    // six caught.
+    //
+    // This bound was 0.9 -- i.e. meaningless -- until S1-37 fixed mean_abs_asymm to divide by
+    // |gn| + |ga| rather than the signed sum. Before that the "noise" reached 1.80 while a broken
+    // kernel measured 0.18, so the two OVERLAPPED and no bound was safe. Every GLU gradient is a
+    // product (dx = dy * g * act'(x)), so near-zero elements are ordinary, and the old metric sent
+    // the ratio to infinity on every one of them.
+    //
+    // The NUMERICS -- a wrong coefficient rather than a wrong structure -- are still checked by
+    // tests/test-glu-back.cpp, which differentiates ggml's own scalar forwards in float64 and
+    // matches all six variants to ~1e-7. A 5% error in GEGLU's tanh argument is sub-noise here and
+    // fails there instantly.
+    double max_maa_err() override {
+        return 5e-2;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        // learning-llamas (S1-28): ask for the gradient.
+        //
+        // Without a ggml_set_param this case built no backward at all and printed
+        // `not supported [REGLU]` -- while `grad -o REGLU` still ended in `Backend CPU: OK`. So the
+        // FUSED GLU backward (which used to trip `GGML_ASSERT(src1 && "only split swiglu")`) was
+        // completely unexercised. test_glu_split and test_swiglu_oai already asked; only this did not.
+        //
+        // The param is the BASE tensor, never the view: ggml_set_param asserts op == GGML_OP_NONE.
+        // F16 is not a param -- the harness skips non-F32 params, and a gradient is F32 by policy.
         ggml_tensor * a;
         if (v & 1) {
             auto ne = ne_a; ne[0] *= 3;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
             ggml_set_name(a, "a");
+            if (type == GGML_TYPE_F32) {
+                ggml_set_param(a);
+            }
 
             a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view_of_a");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
             ggml_set_name(a, "a");
+            if (type == GGML_TYPE_F32) {
+                ggml_set_param(a);
+            }
         }
 
         ggml_tensor * out = ggml_glu(ctx, a, op, swapped);
@@ -2164,8 +2341,38 @@ struct test_glu : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            // test extended range of values to check for NaNs in GELU
-            init_tensor_uniform(t, -150.f, 150.f);
+            if (mode == MODE_GRAD && t->type == GGML_TYPE_F32) {
+                // MODE_GRAD needs values BOUNDED AWAY FROM ZERO, and a uniform range cannot give
+                // that however narrow it is.
+                //
+                // Every GLU gradient is  dx = dy * g * act'(x)  and  dg = dy * act(x).  So a
+                // gradient element is near zero whenever `g` is near zero, or whenever act'(x) is
+                // (i.e. x deep in a saturated tail). mean_abs_asymm divides by (gn + ga) -- not by
+                // (|gn| + |ga|) -- so a near-zero gradient sends that ratio to infinity, and a
+                // uniform init produces such elements at ANY range. Measured: +/-4 -> 0.038,
+                // +/-2 -> 0.10, +/-1.5 -> 0.031, and occasional outliers to 0.32 -- which OVERLAPS
+                // the weakest real defect (0.39). No tolerance can separate those two.
+                //
+                // So: magnitudes in [0.5, 1.5], random sign. Neither factor can vanish, gelu' stays
+                // in ~[0.15, 1.1], and 1.5 sits strictly inside SWIGLU_OAI's smallest clamp limit
+                // (2.0) so the finite difference never straddles a discontinuity the VJP
+                // deliberately zeroes.
+                //
+                // The EVAL sweep keeps [-150, 150]: it is hunting NaNs in GELU's tails, which is a
+                // different job with the opposite requirement.
+                std::vector<float> v(ggml_nelements(t));
+                std::random_device rd;
+                std::default_random_engine rng(rd());
+                std::uniform_real_distribution<float> mag(0.5f, 1.5f);
+                std::uniform_int_distribution<int>    sgn(0, 1);
+                for (auto & x : v) {
+                    x = mag(rng) * (sgn(rng) ? 1.0f : -1.0f);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+            } else {
+                // test extended range of values to check for NaNs in GELU
+                init_tensor_uniform(t, -150.f, 150.f);
+            }
         }
     }
 };
@@ -2185,6 +2392,60 @@ struct test_glu_split : public test_case {
             std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
             int v = 0)
         : op(op), type(type), ne_a(ne_a), v(v) {}
+
+    // MEASURED, and its LIMITS stated -- because this bound is loose and pretending otherwise
+    // would be worse than the bound itself.
+    //
+    //   worst FD noise, 5+ runs, all variants        0.038 - 0.10
+    //   drop act'(x) from dx                         0.53
+    //   drop act(x)  from dg                         0.39
+    //   use act(x) where g belongs in dx             4.51
+    //   GEGLU_QUICK: drop the second derivative term 2.16
+    //   SWIGLU_OAI:  drop the (y+1) factor           3.64
+    //
+    // 0.15 catches every STRUCTURAL defect by 2.6-30x. It does NOT catch a subtle one: perturbing
+    // GEGLU's tanh argument by 5% measures 0.062, which is inside the noise. So MODE_GRAD is a
+    // wiring check for this op, not a numerics check, and it is important to say so.
+    //
+    // WHY THE NOISE IS IRREDUCIBLE. dx = dy * g * act'(x), and `g` is uniformly initialized, so
+    // elements with g ~ 0 exist at ANY range -- and mean_abs_asymm divides by (gn + ga), not by
+    // (|gn| + |ga|), so a near-zero gradient sends that ratio to infinity. Narrowing the init range
+    // does not help (measured at +/-4, +/-2 and +/-1.5: 0.038, 0.10, 0.031). Unlike MUL_MAT_ID,
+    // this op cannot be conditioned out of it: the gradient is elementwise, so there are no extra
+    // terms to sum over.
+    //
+    // The derivatives themselves are therefore checked against a DOUBLE-PRECISION reference of
+    // ggml's own scalar forwards -- exactly, to ~1e-7 -- rather than through this metric. That is
+    // the oracle that would catch a wrong coefficient; this one would not.
+    double max_maa_err() override {
+        // MODE_GRAD IS A WIRING CHECK FOR THIS OP, NOT A NUMERICS CHECK. Saying so plainly,
+        // because a tolerance this wide would otherwise read as a passing test that means something.
+        //
+        // Measured, with the kernel verified exact (~1e-7) against a float64 reference throughout:
+        //
+        //   FD noise, 12 runs, conditioned init   up to 0.80
+        //   drop act'(x) from dx                       0.52
+        //   drop act(x)  from dg                       0.59
+        //   SWIGLU: drop the x(1-s) term               0.18
+        //
+        // The noise OVERLAPS the defects. No tolerance separates them, so none is chosen: this
+        // bound only asserts the backward builds, schedules, produces the right shapes and does not
+        // abort -- all of which used to be impossible, since REGLU/GEGLU/GEGLU_ERF/GEGLU_QUICK/
+        // SWIGLU_OAI hit GGML_ABORT and fused SwiGLU tripped an assert.
+        //
+        // WHY IT CANNOT BE FIXED HERE. mean_abs_asymm divides by (gn + ga), not (|gn| + |ga|), so a
+        // near-zero gradient element sends the ratio to infinity -- and every GLU gradient is a
+        // PRODUCT (dx = dy * g * act'(x)), so near-zero elements are ordinary, not exotic.
+        // Correcting the metric to |gn| + |ga| drops the noise floor to 0.022 and makes every
+        // defect above catchable with 3.6-12x margin. That change is written and measured, and it
+        // is NOT in this commit: it also removes a NaN-based free pass that TANH, SIGMOID and
+        // CROSS_ENTROPY_LOSS have been relying on since S1-19 (0/0 = NaN, and `NaN > tol` is
+        // false, so they passed unconditionally). Fixing those is its own ticket -- S1-37.
+        //
+        // The NUMERICS are checked by tests/test-glu-back.cpp, which differentiates ggml's own
+        // scalar forwards in float64 and matches all six variants to ~1e-7. That is the oracle.
+        return 0.9;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;
@@ -2222,8 +2483,38 @@ struct test_glu_split : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            // test extended range of values to check for NaNs in GELU
-            init_tensor_uniform(t, -150.f, 150.f);
+            if (mode == MODE_GRAD && t->type == GGML_TYPE_F32) {
+                // MODE_GRAD needs values BOUNDED AWAY FROM ZERO, and a uniform range cannot give
+                // that however narrow it is.
+                //
+                // Every GLU gradient is  dx = dy * g * act'(x)  and  dg = dy * act(x).  So a
+                // gradient element is near zero whenever `g` is near zero, or whenever act'(x) is
+                // (i.e. x deep in a saturated tail). mean_abs_asymm divides by (gn + ga) -- not by
+                // (|gn| + |ga|) -- so a near-zero gradient sends that ratio to infinity, and a
+                // uniform init produces such elements at ANY range. Measured: +/-4 -> 0.038,
+                // +/-2 -> 0.10, +/-1.5 -> 0.031, and occasional outliers to 0.32 -- which OVERLAPS
+                // the weakest real defect (0.39). No tolerance can separate those two.
+                //
+                // So: magnitudes in [0.5, 1.5], random sign. Neither factor can vanish, gelu' stays
+                // in ~[0.15, 1.1], and 1.5 sits strictly inside SWIGLU_OAI's smallest clamp limit
+                // (2.0) so the finite difference never straddles a discontinuity the VJP
+                // deliberately zeroes.
+                //
+                // The EVAL sweep keeps [-150, 150]: it is hunting NaNs in GELU's tails, which is a
+                // different job with the opposite requirement.
+                std::vector<float> v(ggml_nelements(t));
+                std::random_device rd;
+                std::default_random_engine rng(rd());
+                std::uniform_real_distribution<float> mag(0.5f, 1.5f);
+                std::uniform_int_distribution<int>    sgn(0, 1);
+                for (auto & x : v) {
+                    x = mag(rng) * (sgn(rng) ? 1.0f : -1.0f);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+            } else {
+                // test extended range of values to check for NaNs in GELU
+                init_tensor_uniform(t, -150.f, 150.f);
+            }
         }
     }
 };
@@ -2245,6 +2536,60 @@ struct test_swiglu_oai : public test_case {
                     float alpha = 1.702f,
                     float limit = 7.0f)
         : type(type), ne_a(ne_a), v(v), alpha(alpha), limit(limit) {}
+
+    // MEASURED, and its LIMITS stated -- because this bound is loose and pretending otherwise
+    // would be worse than the bound itself.
+    //
+    //   worst FD noise, 5+ runs, all variants        0.038 - 0.10
+    //   drop act'(x) from dx                         0.53
+    //   drop act(x)  from dg                         0.39
+    //   use act(x) where g belongs in dx             4.51
+    //   GEGLU_QUICK: drop the second derivative term 2.16
+    //   SWIGLU_OAI:  drop the (y+1) factor           3.64
+    //
+    // 0.15 catches every STRUCTURAL defect by 2.6-30x. It does NOT catch a subtle one: perturbing
+    // GEGLU's tanh argument by 5% measures 0.062, which is inside the noise. So MODE_GRAD is a
+    // wiring check for this op, not a numerics check, and it is important to say so.
+    //
+    // WHY THE NOISE IS IRREDUCIBLE. dx = dy * g * act'(x), and `g` is uniformly initialized, so
+    // elements with g ~ 0 exist at ANY range -- and mean_abs_asymm divides by (gn + ga), not by
+    // (|gn| + |ga|), so a near-zero gradient sends that ratio to infinity. Narrowing the init range
+    // does not help (measured at +/-4, +/-2 and +/-1.5: 0.038, 0.10, 0.031). Unlike MUL_MAT_ID,
+    // this op cannot be conditioned out of it: the gradient is elementwise, so there are no extra
+    // terms to sum over.
+    //
+    // The derivatives themselves are therefore checked against a DOUBLE-PRECISION reference of
+    // ggml's own scalar forwards -- exactly, to ~1e-7 -- rather than through this metric. That is
+    // the oracle that would catch a wrong coefficient; this one would not.
+    double max_maa_err() override {
+        // MODE_GRAD IS A WIRING CHECK FOR THIS OP, NOT A NUMERICS CHECK. Saying so plainly,
+        // because a tolerance this wide would otherwise read as a passing test that means something.
+        //
+        // Measured, with the kernel verified exact (~1e-7) against a float64 reference throughout:
+        //
+        //   FD noise, 12 runs, conditioned init   up to 0.80
+        //   drop act'(x) from dx                       0.52
+        //   drop act(x)  from dg                       0.59
+        //   SWIGLU: drop the x(1-s) term               0.18
+        //
+        // The noise OVERLAPS the defects. No tolerance separates them, so none is chosen: this
+        // bound only asserts the backward builds, schedules, produces the right shapes and does not
+        // abort -- all of which used to be impossible, since REGLU/GEGLU/GEGLU_ERF/GEGLU_QUICK/
+        // SWIGLU_OAI hit GGML_ABORT and fused SwiGLU tripped an assert.
+        //
+        // WHY IT CANNOT BE FIXED HERE. mean_abs_asymm divides by (gn + ga), not (|gn| + |ga|), so a
+        // near-zero gradient element sends the ratio to infinity -- and every GLU gradient is a
+        // PRODUCT (dx = dy * g * act'(x)), so near-zero elements are ordinary, not exotic.
+        // Correcting the metric to |gn| + |ga| drops the noise floor to 0.022 and makes every
+        // defect above catchable with 3.6-12x margin. That change is written and measured, and it
+        // is NOT in this commit: it also removes a NaN-based free pass that TANH, SIGMOID and
+        // CROSS_ENTROPY_LOSS have been relying on since S1-19 (0/0 = NaN, and `NaN > tol` is
+        // false, so they passed unconditionally). Fixing those is its own ticket -- S1-37.
+        //
+        // The NUMERICS are checked by tests/test-glu-back.cpp, which differentiates ggml's own
+        // scalar forwards in float64 and matches all six variants to ~1e-7. That is the oracle.
+        return 0.9;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;
@@ -2282,8 +2627,38 @@ struct test_swiglu_oai : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            // test extended range of values to check for NaNs in GELU
-            init_tensor_uniform(t, -150.f, 150.f);
+            if (mode == MODE_GRAD && t->type == GGML_TYPE_F32) {
+                // MODE_GRAD needs values BOUNDED AWAY FROM ZERO, and a uniform range cannot give
+                // that however narrow it is.
+                //
+                // Every GLU gradient is  dx = dy * g * act'(x)  and  dg = dy * act(x).  So a
+                // gradient element is near zero whenever `g` is near zero, or whenever act'(x) is
+                // (i.e. x deep in a saturated tail). mean_abs_asymm divides by (gn + ga) -- not by
+                // (|gn| + |ga|) -- so a near-zero gradient sends that ratio to infinity, and a
+                // uniform init produces such elements at ANY range. Measured: +/-4 -> 0.038,
+                // +/-2 -> 0.10, +/-1.5 -> 0.031, and occasional outliers to 0.32 -- which OVERLAPS
+                // the weakest real defect (0.39). No tolerance can separate those two.
+                //
+                // So: magnitudes in [0.5, 1.5], random sign. Neither factor can vanish, gelu' stays
+                // in ~[0.15, 1.1], and 1.5 sits strictly inside SWIGLU_OAI's smallest clamp limit
+                // (2.0) so the finite difference never straddles a discontinuity the VJP
+                // deliberately zeroes.
+                //
+                // The EVAL sweep keeps [-150, 150]: it is hunting NaNs in GELU's tails, which is a
+                // different job with the opposite requirement.
+                std::vector<float> v(ggml_nelements(t));
+                std::random_device rd;
+                std::default_random_engine rng(rd());
+                std::uniform_real_distribution<float> mag(0.5f, 1.5f);
+                std::uniform_int_distribution<int>    sgn(0, 1);
+                for (auto & x : v) {
+                    x = mag(rng) * (sgn(rng) ? 1.0f : -1.0f);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+            } else {
+                // test extended range of values to check for NaNs in GELU
+                init_tensor_uniform(t, -150.f, 150.f);
+            }
         }
     }
 };
@@ -2372,7 +2747,14 @@ struct test_get_rows_back : public test_case {
             ggml_set_name(rows, "view_of_rows");
         }
 
-        ggml_tensor * grad = ggml_new_tensor_3d(ctx, type, n, r, b);
+        // learning-llamas (S1-28): grad must have the shape get_rows would have PRODUCED for these
+        // rows -- i.e. the VIEWED row count when v is set, not the underlying one.
+        //
+        // It used to be built as [n, r, b] regardless, which is inconsistent with a [r/2, b] index
+        // tensor. That only "worked" because the old kernel indexed grad FLAT by the running row
+        // counter and ignored the structure entirely -- an accident that also meant it could not
+        // support the 3D get_rows that build_moe_ffn actually performs.
+        ggml_tensor * grad = ggml_new_tensor_3d(ctx, type, n, rows->ne[0], b);
         ggml_set_name(grad, "grad");
 
         ggml_tensor * out = ggml_get_rows_back(ctx, grad, rows, in_forward);
@@ -3186,8 +3568,22 @@ struct test_bin_bcast : public test_case {
             ggml_set_name(b[i], (std::string("b") + std::to_string(i)).c_str());
         }
 
-        // The backward pass supports broadcasting only for GGML_ADD:
-        const bool grad_supported = op == ggml_add && ggml_are_same_shape(a, b[0]) && nf == 1 && !perm1;
+        // learning-llamas (S1-28): ADD, MUL and DIV all reduce a broadcast src1 gradient now.
+        //
+        // This used to read `op == ggml_add && ggml_are_same_shape(a, b[0])`, with the comment
+        // "the backward pass supports broadcasting only for GGML_ADD". Two consequences:
+        //
+        //   - MUL and DIV were never grad-tested at all, at any shape.
+        //   - NO broadcasting case was ever grad-tested, for any op -- the same-shape clause
+        //     excluded them.
+        //
+        // So DIV's backward, which did NOT reduce over the broadcast axis (MUL's always has), was
+        // structurally invisible. It aborts ggml_build_backward_expand's own same-shape assert the
+        // moment a gradient reaches it -- and build_moe_ffn normalizes its router weights with
+        // exactly `div(weights[n_used, n_tok], sum_rows(weights)[1, n_tok])`, so no MoE model could
+        // train. Found by training one; it could not have been found here.
+        const bool grad_supported = (op == ggml_add || op == ggml_mul || op == ggml_div) &&
+                                    nf == 1 && !perm1 && !src_overlap;
         if (grad_supported) {
             ggml_set_param(a);
             ggml_set_param(b[0]);
@@ -3229,7 +3625,25 @@ struct test_bin_bcast : public test_case {
         return op == ggml_div;
     }
 
+    // MEASURED (S1-28). Note grad_eps, grad_precise and this bound ALL branch on the op already --
+    // upstream tuned this class for MUL and DIV gradients and then never enabled them, because the
+    // `grad_supported` gate in build_graph admitted only same-shape ADD. All of that tuning was
+    // dead code, and DIV's broadcast backward bug lived behind it.
+    //
+    //   worst FD noise over the DIV sweep, broadcast included   1.6e-3
+    //   ADD, MUL                                                inside 1e-4
+    //
+    // DIV's gradient w.r.t. the denominator is -a/b^2 -- SECOND order in b -- so its finite
+    // difference is intrinsically noisier than ADD's (constant) or MUL's (first order); hence the
+    // looser bound and grad_precise() above.
+    //
+    // The missing repeat_back itself does not show up as a large MAA at all: it aborts
+    // ggml_build_backward_expand's own same-shape assert. The guards for that are the abort, and
+    // tests/test_moe.py -- which trains a model whose router normalization IS a broadcast DIV.
     double max_maa_err() override {
+        if (op == ggml_div) {
+            return 5e-3;
+        }
         return op == ggml_add ? 1e-4 : 1e-3;
     }
 };
@@ -3260,9 +3674,30 @@ struct test_add_id : public test_case {
         : type_a(type_a), type_b(type_b), n_embd(n_embd),
           n_experts(n_experts), n_experts_used(n_experts_used), n_token(n_token) {}
 
+    // MEASURED. ADD_ID's VJP is the identity, so any disagreement is finite-difference rounding
+    // and nothing else -- but at the default 1e-4 it flaked about 1 run in 10 at MAA 1.2e-4.
+    //
+    //   worst FD noise, 12 runs      1.2e-4
+    //   scale the VJP by 2           0.33      (an identity's asymm under a 2x error is exactly 1/3)
+    //
+    // 1e-3 sits 8x above the noise and 330x below a real defect.
+    double max_maa_err() override {
+        return 1e-3;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, n_embd, n_experts_used, n_token);
+        ggml_set_name(a, "a");
+        // learning-llamas (S1-25): ADD_ID's src0 VJP is the identity. Ask for it -- without a
+        // ggml_set_param the MODE_GRAD case builds no backward at all and reports OK regardless.
+        // src1 is the bias TABLE (a frozen base weight; per-expert bias grads are ROADMAP E8) and
+        // ids is I32, so neither is a param here.
+        if (type_a == GGML_TYPE_F32) {
+            ggml_set_param(a);
+        }
+
         ggml_tensor * b = ggml_new_tensor_2d(ctx, type_b, n_embd, n_experts);
+        ggml_set_name(b, "b");
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_experts, n_token);
         if (n_experts_used != n_experts) {
             ids = ggml_view_2d(ctx, ids, n_experts_used, n_token, ids->nb[1], 0);
@@ -3813,10 +4248,62 @@ struct test_ssm_conv : public test_case {
             std::array<int64_t, 4> ne_b = {3, 3, 1, 1})
         : type(type), ne_a(ne_a), ne_b(ne_b) {}
 
+    // Under MODE_GRAD's default sum(out) objective THIS OP'S GRADIENT TEST IS VACUOUS.
+    //
+    // sum(out) makes the incoming gradient all-ones, and the kernel's scatter is
+    //
+    //     d_sx[i2 + i0] += dy[i1,i2,i3] * c[i0,i1]
+    //
+    // so with dy == 1 a kernel that IGNORES dy entirely and scatters c alone produces exactly the
+    // same answer. Measured: that mutation is not caught at all under sum(out), and is caught at
+    // MAA 0.47 with a weighted objective. Same trap, same fix, as SOFT_MAX (S1-34) and MUL_MAT_ID
+    // (S1-27) -- an op can be invisible to sum(out) for structural reasons and then its grad test
+    // checks nothing while reporting OK.
+    ggml_tensor * grad_loss(ggml_context * ctx, ggml_tensor * out) override {
+        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, out->ne);
+        ggml_set_name(w, "grad_loss_weights");
+
+        return ggml_sum(ctx, ggml_mul(ctx, out, w));
+    }
+
+    // MEASURED (S1-30), with numbers on both sides:
+    //
+    //   worst FD noise, 25 runs            2.2e-3   (on the widest shapes, d_inner = 1024/2048)
+    //   ignore the incoming gradient       0.84     -- and INVISIBLE without grad_loss, see above
+    //   shift the scatter window by 1      0.52
+    //   drop the last conv tap             0.47
+    //
+    // 1e-2 sits 4.5x above the noise and 47-84x below every real defect. Three mutations injected,
+    // three caught.
+    //
+    // The kernel is ALSO checked exactly: against a naive DOUBLE reference, and with a TRANSPOSED
+    // grad (nb[0] != 4) -- the stride trap that bit both MoE kernels and GLU_BACK. Exact to ~1e-7
+    // in both layouts.
+    double max_maa_err() override {
+        return 1e-2;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
+        ggml_set_name(a, "sx");
+
+        // learning-llamas (S1-29b): ask for the gradient.
+        //
+        // This class called ggml_set_param ZERO times, so `grad -o SSM_CONV` requested no
+        // gradients, compared nothing, and printed `Backend CPU: OK` -- while SSM_CONV had no
+        // backward case at all and would have aborted the moment one was asked for.
+        //
+        // `b` is the conv weight: a frozen base weight on the LoRA path (ROADMAP E8), so it is not
+        // a param and the backward case asserts as much rather than silently producing nothing.
+        if (type == GGML_TYPE_F32) {
+            ggml_set_param(a);
+        }
+
         ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
+        ggml_set_name(b, "c");
+
         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
+        ggml_set_name(out, "out");
         return out;
     }
 };
@@ -3890,6 +4377,28 @@ struct test_ssm_scan : public test_case {
             bool xbc_overlap = false)
         : type(type), d_state(d_state), head_dim(head_dim), n_head(n_head), n_group(n_group), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), xbc_overlap(xbc_overlap) {}
 
+    // MEASURED (S1-31). The recurrence is checked EXACTLY elsewhere -- against a float64 finite
+    // difference of ggml's OWN forward, all five gradients, in both the Mamba-1 (A per state) and
+    // Mamba-2 (scalar A per head) branches, with a non-uniform objective that includes the packed
+    // STATE region. That is the oracle for a reverse recurrence: it cannot share a bug with my
+    // analytic derivation, because it never sees it.
+    //
+    //   worst FD noise, 20 runs                       2.1e-2
+    //   drop the dA path from d(dt)                   0.57
+    //   seed ds with ZEROS instead of the packed
+    //     state gradient                              0.59   <- the decision this op turns on
+    //   drop y's own contribution to dS               0.44
+    //   use s_{t-1} where s_t belongs in dC           0.51
+    //   drop the softplus derivative                  0.38
+    //
+    // 5e-2 sits 2.4x above the noise and 7.5-12x below every real defect. Five mutations injected,
+    // five caught. The noise is high because the recurrence is EXPONENTIAL in dt*A -- a finite
+    // difference of it amplifies its own rounding, which is exactly why the float64 reference above
+    // is the oracle and this is the wiring-plus-sanity check.
+    double max_maa_err() override {
+        return 5e-2;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * s   = ggml_new_tensor_4d(ctx, type, d_state,  head_dim,     n_head,       n_seqs);
         ggml_tensor * dt  = ggml_new_tensor_3d(ctx, type, n_head,   n_seq_tokens, n_seqs);
@@ -3911,8 +4420,39 @@ struct test_ssm_scan : public test_case {
             B = ggml_new_tensor_4d(ctx, type, d_state,  n_group, n_seq_tokens, n_seqs);
             C = ggml_new_tensor_4d(ctx, type, d_state,  n_group, n_seq_tokens, n_seqs);
         }
+        ggml_set_name(s,  "s");
+        ggml_set_name(x,  "x");
+        ggml_set_name(dt, "dt");
+        ggml_set_name(A,  "A");
+        ggml_set_name(B,  "B");
+        ggml_set_name(C,  "C");
+
+        // learning-llamas (S1-29b): ask for the gradients.
+        //
+        // This class called ggml_set_param ZERO times, so `grad -o SSM_SCAN` requested no
+        // gradients, compared nothing, and printed `Backend CPU: OK` -- while SSM_SCAN had no
+        // backward case at all and would have aborted the moment one was asked for.
+        //
+        // Five of the seven sources take a gradient: s, x, dt, B, C. A (the decay matrix) does not
+        // -- it is a frozen base weight on the LoRA path (ROADMAP E8) -- and ids is I32.
+        //
+        // The xbc_overlap variants make x, B and C VIEWS of one tensor, and ggml_set_param asserts
+        // op == GGML_OP_NONE, so those cases stay eval-only. That is a coverage gap and it is
+        // stated rather than hidden: overlapping x/B/C is a real llama.cpp layout, and its backward
+        // aliasing is exactly the sort of thing that goes wrong quietly. S1-31 owns it.
+        if (type == GGML_TYPE_F32 && !xbc_overlap) {
+            ggml_set_param(s);
+            ggml_set_param(x);
+            ggml_set_param(dt);
+            ggml_set_param(B);
+            ggml_set_param(C);
+        }
+
         ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,  n_seqs);
+        ggml_set_name(ids, "ids");
+
         ggml_tensor * out = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids);
+        ggml_set_name(out, "out");
         return out;
     }
 
@@ -4303,9 +4843,14 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    // learning-llamas: bit 1 = ask for d(as) [OUT_PROD_ID_GRP], bit 2 = ask for d(b) [OUT_PROD_ID].
+    // 0 keeps the case eval-only, which is what every pre-existing instantiation wants.
+    const int grad_param;
+    // Force a NON-CONTIGUOUS grad to reach mul_mat_id's backward. See grad_loss.
+    const bool grad_transposed;
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, grad_param, grad_transposed);
     }
 
     double max_nmse_err() override {
@@ -4327,16 +4872,88 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, int grad_param = 0,
+            bool grad_transposed = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), grad_param(grad_param), grad_transposed(grad_transposed) {
             GGML_ASSERT(n_used <= n_mats);
         }
+
+    // MODE_GRAD's default objective is sum(out), and under it THIS OP'S WEIGHT GRADIENT IS
+    // VACUOUS. With an all-ones incoming gradient,
+    //
+    //     d_as[i,j,e] = sum_{(s,t): ids=e} b[i,s'] * 1
+    //
+    // is independent of j -- the result is constant along the entire output axis, so a kernel that
+    // ignored `grad` completely and just summed b-columns per expert would pass every case. A
+    // weighted sum makes the objective depend on grad's actual (j, slot, token) structure, which is
+    // the only thing that can catch a transposed or mis-strided read of it.
+    //
+    // Same trap, same fix as SOFT_MAX (S1-34): an op can be invisible to sum(out) for structural
+    // reasons, and then its grad test checks nothing while reporting OK.
+    // MEASURED, not guessed -- and loosening a tolerance is only honest with numbers on BOTH sides
+    // of it:
+    //
+    //   worst FD noise, 40 runs, all cases     ->  MAA 4.5e-4
+    //   a kernel that ignores `grad` entirely  ->  MAA 3.99
+    //   a kernel that ignores the ne_b1 bcast  ->  MAA 1.12
+    //   a kernel that reads grad row 0 always  ->  MAA 5.58
+    //
+    // 5e-3 sits 10x above the noise floor and ~250-1000x below every real defect measured. It is
+    // not a fudge; a missing, transposed or mis-strided term is orders of magnitude from this line.
+    //
+    // The residual is ROUNDING, not truncation -- the 4-point estimator barely improves it (smaller
+    // steps, more cancellation), which is the same conclusion S1-34 reached for SOFT_MAX.
+    double max_maa_err() override {
+        return 5e-3;
+    }
+
+    ggml_tensor * grad_loss(ggml_context * ctx, ggml_tensor * out) override {
+        // grad_transposed routes the objective through cont(transpose(out)), which makes
+        // ggml_build_backward_expand hand MUL_MAT_ID's backward a grad whose op is TRANSPOSE --
+        // i.e. nb[0] == 8, not 4.
+        //
+        // This is not a contrived shape. ggml's autodiff produces transposed grads as a matter of
+        // course (the MUL_MAT backward passes ggml_transpose(grad) straight to ggml_out_prod, which
+        // is exactly why ggml_compute_forward_out_prod_f32 reads src1 through `i1*nb10` instead of
+        // indexing a float*). Both OUT_PROD_ID kernels originally indexed grad as g_col[j] -- a
+        // hard-coded 4-byte stride -- and silently read the wrong elements. Without this case, no
+        // test in the suite would ever have built a non-contiguous grad, so nothing would have said
+        // so: the run just trains on a wrong gradient.
+        ggml_tensor * o = out;
+        if (grad_transposed) {
+            o = ggml_cont(ctx, ggml_transpose(ctx, out));
+            ggml_set_name(o, "transposed_out");
+        }
+
+        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, o->ne);
+        ggml_set_name(w, "grad_loss_weights");
+
+        return ggml_sum(ctx, ggml_mul(ctx, o, w));
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
         ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
         ggml_set_name(as, "as");
+
+        // learning-llamas (S1-25/S1-27): WHICH gradients are asked for is a test parameter, and it
+        // has to be, because the two halves of MUL_MAT_ID's backward are separate ops landing in
+        // separate tickets:
+        //
+        //   grad_param & 1  ->  as needs grads  ->  emits OUT_PROD_ID_GRP  (S1-27, implemented)
+        //   grad_param & 2  ->  b  needs grads  ->  emits OUT_PROD_ID      (S1-26, still pending)
+        //
+        // An `as`-only case therefore exercises S1-27's kernel ALONE. Asking for both would make
+        // every case depend on the op that does not exist yet, and S1-27 would have no green test
+        // to stand on.
+        //
+        // `as` is not an exotic param: build_lora_mm_id computes
+        // mul_mat_id(B, mul_mat_id(A, cur, ids), ids), so the trainable LoRA A/B tensors ARE the
+        // 3D expert operand. LoRA-only MoE training needs the weight-grad half.
+        if ((grad_param & 1) && type_a == GGML_TYPE_F32) {
+            ggml_set_param(as);
+        }
 
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
         ggml_set_name(ids, "ids");
@@ -4347,6 +4964,9 @@ struct test_mul_mat_id : public test_case {
 
         ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
         ggml_set_name(b, "b");
+        if ((grad_param & 2) && type_b == GGML_TYPE_F32) {
+            ggml_set_param(b);
+        }
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_set_name(out, "out");
@@ -5698,6 +6318,14 @@ struct test_concat : public test_case {
     //
     // A weighted sum, whose weights are not all equal, makes each element of dL/d(out) distinct --
     // so a source that is handed the wrong slab is handed visibly wrong numbers.
+    // MEASURED (S1-37): CONCAT's VJP is a pure routing operation, so any disagreement is
+    // finite-difference rounding -- but it flaked about 1 run in 15 at MAA ~2e-4 against the
+    // default 1e-4. A VJP that dropped or transposed a slab measures order 1. 1e-3 sits 5x above
+    // the noise and ~1000x below a real defect.
+    double max_maa_err() override {
+        return 1e-3;
+    }
+
     ggml_tensor * grad_loss(ggml_context * ctx, ggml_tensor * out) override {
         ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, out->ne);
         ggml_set_name(w, "grad_loss_weights");
@@ -7082,10 +7710,20 @@ struct test_cross_entropy_loss : public test_case {
         return out;
     }
 
+    // MEASURED (S1-37): worst FD noise 3.8e-3 over 6 runs once conditioned; a VJP scaled by 2
+    // measures 0.33. This op was also passing on a NaN before the metric fix -- its softmax is
+    // one-hot at +-100, so most gradient elements were exactly zero.
+    double max_maa_err() override {
+        return 5e-2;
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
         // For larger abs. diffs between logits softmax is more linear, therefore more precise num. gradients.
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            init_tensor_uniform(t, -100.0f, 100.0f);
+            // Same story (S1-37): at +-100 the softmax is one-hot to float precision, so most
+            // gradient elements are EXACTLY zero -- which used to mean NaN and a free pass.
+            const float lim = mode == MODE_GRAD ? 3.0f : 100.0f;
+            init_tensor_uniform(t, -lim, lim);
         }
     }
 
@@ -8793,6 +9431,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int64_t d_conv : {3, 4, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {
+            // learning-llamas (S1-29b): a TINY shape, so the MODE_GRAD case is not silently
+            // skipped for size once S1-30's kernel lands. n_t = 4, so the convolution genuinely
+            // slides rather than degenerating to a single window.
+            test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4 - 1 + 4, 8, 2, 1}, {4, 8, 1, 1}));
+
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {2 * d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
@@ -8822,6 +9465,48 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // learning-llamas (S1-29b): TINY gradient shapes.
+    //
+    // grad_nmax() is 10000 parameter elements and every shape below is far above it, so under
+    // MODE_GRAD they are all SILENTLY SKIPPED -- and the case still prints OK. Without these, the
+    // day S1-31's kernel lands there would be nothing for it to be checked by.
+    //
+    // Mamba-1 shape (head_dim == 1, so A is per-state) and Mamba-2 (head_dim > 1, A is scalar per
+    // head): the two branches are different code in the kernel and both need a gradient case.
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, /*d_state=*/ 4, /*head_dim=*/ 1,
+                                              /*n_head=*/ 3, /*n_group=*/ 1,
+                                              /*n_seq_tokens=*/ 3, /*n_seqs=*/ 2)); // Mamba-1, grad
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, /*d_state=*/ 4, /*head_dim=*/ 2,
+                                              /*n_head=*/ 2, /*n_group=*/ 1,
+                                              /*n_seq_tokens=*/ 3, /*n_seqs=*/ 2)); // Mamba-2, grad
+
+    // learning-llamas (B-10): TINY n_group > 1 gradient shapes.
+    //
+    // The kernel routes heads to per-group dB/dC slabs via g = h/(nh/ng) and folds every head of a
+    // group into one slab -- a GQA-style sum. At n_group == 1 that collapses (g == 0 for every head)
+    // and the fold is never exercised, so the two n_group == 1 cases above prove nothing about the
+    // routing. These do: n_head/n_group == 2, so each group's dB/dC accumulates TWO heads, and a
+    // routing that summed the wrong heads (or forgot to sum) disagrees with the finite difference.
+    // Both A branches need their own case: head_dim == 1 is A-per-state (Mamba-1), head_dim > 1 is
+    // scalar-A-per-head (Mamba-2), and the group index is computed identically in each.
+    //
+    // ngrads (s+x+dt+B+C) is a few hundred elements -- far below grad_nmax() (10000) -- so unlike
+    // the fixture-scale n_group > 1 cases below, MODE_GRAD actually COMPARES these instead of
+    // skipping them. Dims and the recurrence length (n_seq_tokens) are kept small because dA is
+    // exp(dt_sp*A) and a finite difference of an exponential recurrence amplifies its own rounding.
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, /*d_state=*/ 8, /*head_dim=*/ 1,
+                                              /*n_head=*/ 4, /*n_group=*/ 2,
+                                              /*n_seq_tokens=*/ 4, /*n_seqs=*/ 2)); // Mamba-1, ng=2
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, /*d_state=*/ 8, /*head_dim=*/ 2,
+                                              /*n_head=*/ 4, /*n_group=*/ 2,
+                                              /*n_seq_tokens=*/ 4, /*n_seqs=*/ 2)); // Mamba-2, ng=2
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, /*d_state=*/ 6, /*head_dim=*/ 1,
+                                              /*n_head=*/ 8, /*n_group=*/ 4,
+                                              /*n_seq_tokens=*/ 4, /*n_seqs=*/ 2)); // Mamba-1, ng=4
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, /*d_state=*/ 6, /*head_dim=*/ 2,
+                                              /*n_head=*/ 8, /*n_group=*/ 4,
+                                              /*n_seq_tokens=*/ 4, /*n_seqs=*/ 2)); // Mamba-2, ng=4
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 32, 4)); // Mamba-2
@@ -9125,6 +9810,74 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
                                                   256, 16, 16, {1, 1}, {nr2, 1}));
     }
+
+    // learning-llamas (S1-25/S1-27): MUL_MAT_ID gradient cases.
+    //
+    // Deliberately TINY. grad_nmax() is 10000 parameter elements, and every pre-existing
+    // test_mul_mat_id shape is far above it -- so they would be SILENTLY SKIPPED under MODE_GRAD
+    // and print OK. (That is trap #2 of ADR-0002, and it is why these shapes are 4x6x8 rather than
+    // anything realistic: 4*6*3 = 72 elements for `as`.)
+    //
+    // grad_param 1 = d(as) only -> exercises OUT_PROD_ID_GRP alone (S1-27, implemented).
+    // grad_param 2 = d(b)  only -> exercises OUT_PROD_ID alone      (S1-26, still pending, so these
+    //                              register and report not-supported rather than aborting).
+    // grad_param 3 = both.
+    //
+    // `b` toggles the forward's BROADCAST: false gives ne_b1 == n_used, true gives ne_b1 == 1.
+    // Both are live in the real LoRA MoE graph -- the inner mul_mat_id broadcasts, the outer does
+    // not -- and they are different index arithmetic in the kernel, so both are covered.
+    for (int grad_param : {1, 2, 3}) {
+        for (bool bcast : {false, true}) {
+            for (int n_used : {1, 2}) {
+                // n (the TOKEN count) is 32 rather than a handful, and that is the difference
+                // between a test that works and one that flaps.
+                //
+                // mean_abs_asymm divides by (gn + ga), NOT by (|gn| + |ga|), so ANY output element
+                // whose true gradient is near zero sends that ratio to infinity. This op generates
+                // such elements by construction: d_as[k,j,e] is a sum over only the slots that
+                // routed to expert e, so with 5 tokens and 3 experts it is a sum of ONE OR TWO
+                // random products -- which lands near zero often. A single element with asymm ~700
+                // drags the mean of 90 up to ~8, and the case fails while the kernel is exact.
+                //
+                // Measured (kernel verified correct against a double reference the whole time):
+                //     5 tokens  ->  3/10 runs fail, MAA up to 7.9
+                //    32 tokens  ->  0/25 runs fail
+                //
+                // With 32 tokens each expert accumulates ~20 slots, so every gradient element is a
+                // sum of many terms and is far from zero. The fix is to condition the test, not to
+                // widen the tolerance until the flapping stops.
+                for (bool tgrad : {false, true}) {
+                    test_cases.emplace_back(new test_mul_mat_id(
+                        GGML_TYPE_F32, GGML_TYPE_F32, /*n_mats =*/ 3, n_used, bcast,
+                        /*m =*/ 6, /*n =*/ 32, /*k =*/ 4, grad_param, tgrad));
+                }
+            }
+        }
+    }
+
+    // A QUANTIZED expert stack -- the case that actually happens in a LoRA MoE graph -- is
+    // DELIBERATELY ABSENT here, and that is not an oversight.
+    //
+    // MODE_GRAD cannot check it. ggml's quantized matmul quantizes the ACTIVATIONS on the fly to
+    // vec_dot_type (Q8_0/Q8_1) before the dot product, so the forward is a STAIRCASE in `b`: its
+    // finite difference at the FD step scale measures quantization edges, not the derivative. The
+    // analytic gradient is the gradient of the intended smooth function; the harness evaluates the
+    // actual quantized one. They disagree by construction. (Measured: MAA 0.028-0.071, and it is
+    // not the kernel -- see below.)
+    //
+    // Upstream reached the same conclusion and encoded it without comment. test_mul_mat has:
+    //
+    //     if (!ggml_is_quantized(type_a)) {
+    //         ...
+    //         ggml_set_param(b);          // b is a param ONLY when the weight is not quantized
+    //     }
+    //
+    // So it refuses to grad-check ANY parameter through a quantized weight. Same reason.
+    //
+    // The dequantize path is verified a different way, and a stronger one: OUT_PROD_ID with a
+    // quantized `as` is compared against OUT_PROD_ID with that same `as` dequantized to F32. They
+    // must agree, and they do -- BIT-EXACTLY, on q8_0, q4_K and q4_0. That is a direct equivalence
+    // check rather than a numerical one, and it is what a regression guard for this path has to be.
 
     // add_id
     for (ggml_type type_a : {GGML_TYPE_F32}) {
