@@ -77,6 +77,17 @@ struct ggml_opt_context {
     struct ggml_tensor *          opt_step_params = nullptr; // Stores output of get_opt_pars.
     struct ggml_tensor *          grad_clip_param = nullptr; // [1], holds grad_clip. See ggml_opt_build.
 
+    // Global gradient norm captured from the last OPT-step eval, for host inspection (S1-10).
+    // Both stay NaN unless that eval ran the OPT graph WITH grad_clip > 0: an unclipped run
+    // builds no norm node, so there is nothing to report and nothing added to its graph. The two
+    // _t pointers index into the transient compute graph and are read back like the loss, right
+    // after the compute -- ggml_opt_build re-sets them (to nullptr) every step, so they are only
+    // dereferenced within the eval that produced them.
+    float                last_grad_norm_pre  = NAN;    // sqrt(sum sq of the UNCLIPPED gradients)
+    float                last_grad_norm_post = NAN;    // sqrt(sum sq of the CLIPPED   gradients)
+    struct ggml_tensor * grad_norm_pre_t     = nullptr;
+    struct ggml_tensor * grad_norm_post_t    = nullptr;
+
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
 };
 
@@ -333,6 +344,11 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
 
+    // The norm tensors live in the transient compute graph rebuilt below; stale pointers from the
+    // previous step's (freed) graph must never be read. Only the grad_clip>0 branch re-sets them.
+    opt_ctx->grad_norm_pre_t  = nullptr;
+    opt_ctx->grad_norm_post_t = nullptr;
+
     const enum ggml_opt_optimizer_type optimizer = opt_ctx->optimizer;
 
     const bool accumulate = opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD &&
@@ -557,6 +573,11 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     // when norm is 0 the denominator is still clip, so it yields 0 rather than a NaN.
     struct ggml_tensor * clip_factor = nullptr;
 
+    // Sum of squares of the CLIPPED gradients, accumulated in the apply loop below so the
+    // post-clip global norm is MEASURED off the tensors the optimizer actually steps on, rather
+    // than inferred from the pre-clip norm times the factor. See grad_norm_post at the loop end.
+    struct ggml_tensor * post_sumsq = nullptr;
+
     if (opt_ctx->grad_clip > 0.0f) {
         struct ggml_tensor * sumsq = nullptr;
 
@@ -575,6 +596,11 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         if (sumsq) {
             struct ggml_tensor * norm = ggml_sqrt(opt_ctx->ctx_compute, sumsq);
             ggml_set_name(norm, "grad_norm");
+
+            // Keep this scalar readable after the compute (ggml_opt_eval reads it back like the
+            // loss). ggml_set_output pins its buffer so the allocator will not reuse it.
+            ggml_set_output(norm);
+            opt_ctx->grad_norm_pre_t = norm;
 
             // denom = max(norm, clip), and the factor is clip/denom -- ONE division, of scalars,
             // before anything touches a gradient.
@@ -606,6 +632,10 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 // The [1] factor broadcasts across the parameter's shape.
                 grad = ggml_mul(opt_ctx->ctx_compute, grad, clip_factor);
                 ggml_format_name(grad, "clipped grad for %s", node->name);
+
+                // Measure the clipped gradient's contribution to the post-clip global norm.
+                struct ggml_tensor * ps = ggml_sum(opt_ctx->ctx_compute, ggml_sqr(opt_ctx->ctx_compute, grad));
+                post_sumsq = post_sumsq ? ggml_add(opt_ctx->ctx_compute, post_sumsq, ps) : ps;
             }
 
             struct ggml_tensor * m = nullptr;
@@ -630,6 +660,16 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             ggml_format_name(opt_step, "%s step for %s", optimizer_name, node->name);
             ggml_build_forward_expand(opt_ctx->gb_opt, opt_step);
         }
+    }
+
+    // The post-clip global norm, sqrt of the summed clipped-gradient squares. Nothing in the
+    // optimizer step consumes it, so expand it into the graph explicitly and pin its buffer.
+    if (post_sumsq) {
+        struct ggml_tensor * grad_norm_post = ggml_sqrt(opt_ctx->ctx_compute, post_sumsq);
+        ggml_set_name(grad_norm_post, "grad_norm_post");
+        ggml_set_output(grad_norm_post);
+        ggml_build_forward_expand(opt_ctx->gb_opt, grad_norm_post);
+        opt_ctx->grad_norm_post_t = grad_norm_post;
     }
 
     if (!opt_ctx->buf_static) {
@@ -755,6 +795,14 @@ struct ggml_tensor * ggml_opt_grad_m(ggml_opt_context_t opt_ctx, struct ggml_ten
 struct ggml_tensor * ggml_opt_grad_v(ggml_opt_context_t opt_ctx, struct ggml_tensor * node) {
     const int i = ggml_opt_node_index(opt_ctx, node);
     return i >= 0 && i < int(opt_ctx->grad_v.size()) ? opt_ctx->grad_v[i] : nullptr;
+}
+
+float ggml_opt_grad_norm_pre(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->last_grad_norm_pre;
+}
+
+float ggml_opt_grad_norm_post(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->last_grad_norm_post;
 }
 
 int64_t ggml_opt_get_iter(ggml_opt_context_t opt_ctx) {
@@ -1010,6 +1058,19 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     }
 
     ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+
+    // Read the pre/post-clip global gradient norms back before the graph pointers are cleared,
+    // exactly like the loss below. They exist only on an OPT eval with grad_clip > 0; anything
+    // else (a forward-only pass, an accumulation micro-step, or an unclipped run) leaves them NaN
+    // so a stale value is never reported.
+    if (opt_ctx->allocated_graph == opt_ctx->gb_opt && opt_ctx->grad_norm_pre_t && opt_ctx->grad_norm_post_t) {
+        ggml_backend_tensor_get(opt_ctx->grad_norm_pre_t,  &opt_ctx->last_grad_norm_pre,  0, sizeof(float));
+        ggml_backend_tensor_get(opt_ctx->grad_norm_post_t, &opt_ctx->last_grad_norm_post, 0, sizeof(float));
+    } else {
+        opt_ctx->last_grad_norm_pre  = NAN;
+        opt_ctx->last_grad_norm_post = NAN;
+    }
+
     opt_ctx->iter += opt_ctx->allocated_graph == opt_ctx->gb_opt;
 
     // Only a BACKWARD eval advances the gradient-accumulation window.

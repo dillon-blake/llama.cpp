@@ -51,10 +51,45 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+// GGML_TEST_SEED makes tensor initialization reproducible run to run (S1-50). Unset (the default)
+// returns -1 and every init site keeps its std::random_device behavior, so nothing changes unless a
+// caller explicitly asks for a seed. The env is read exactly once.
+static int64_t test_backend_ops_seed() {
+    static const int64_t seed = []() -> int64_t {
+        const char * env = getenv("GGML_TEST_SEED");
+        return (env && *env) ? (int64_t) strtoll(env, nullptr, 10) : -1;
+    }();
+    return seed;
+}
+
+// A fresh RNG for one tensor-init site. When GGML_TEST_SEED is set, each site gets its OWN
+// repeatable stream (the base seed mixed with a monotone counter) so distinct sites do not collide
+// or all emit the same values; when unset, it is std::random_device exactly as before. The counter
+// is mutex-guarded because init sites can run from worker threads.
+static std::mt19937 test_backend_ops_rng() {
+    const int64_t seed = test_backend_ops_seed();
+    if (seed < 0) {
+        std::random_device rd;
+        return std::mt19937(rd());
+    }
+    static std::mutex mtx;
+    static uint64_t counter = 0;
+    std::lock_guard<std::mutex> lock(mtx);
+    return std::mt19937((uint32_t) ((uint64_t) seed + 0x9E3779B9ull * (counter++)));
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
-    {
+    if (test_backend_ops_seed() >= 0) {
+        // Deterministic single-threaded fill: the value SEQUENCE must not depend on how the range
+        // was split across worker threads, or the seed would not actually pin the inputs.
+        std::mt19937 gen = test_backend_ops_rng();
+        std::uniform_real_distribution<float> distribution(min, max);
+        for (size_t i = 0; i < nels; i++) {
+            data[i] = distribution(gen);
+        }
+    } else {
         // parallel initialization
         static const size_t n_threads = N_THREADS;
 
@@ -152,8 +187,7 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     std::vector<float>       data_f32(ne0*ne1*ne2*ne3);
     std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen = test_backend_ops_rng();
     std::uniform_real_distribution<float> dis(min, max);
 
     for (size_t i = 0; i < data_f32.size(); i++) {
@@ -168,12 +202,12 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     const int n_inf_zero_blocks = 0.2*(ne0*ne1*ne2*ne3)/(blck0*blck1);
 
     for (int b = 0; b < n_inf_zero_blocks; b++) {
-        const int p3 = (rd() % ne3);
-        const int p2 = (rd() % ne2);
-        const int p1 = (rd() % ne1);
-        const int p0 = (rd() % ne0);
+        const int p3 = (gen() % ne3);
+        const int p2 = (gen() % ne2);
+        const int p1 = (gen() % ne1);
+        const int p0 = (gen() % ne0);
 
-        bool inf = rd() & 1;
+        bool inf = gen() & 1;
 
         for (int i1 = 0; i1 < blck1 && p1 + i1 < ne1; i1++) {
             const int idx = p3*ne2*ne1*ne0 + p2*ne1*ne0 + (p1 + i1)*ne0 + p0;
@@ -199,8 +233,7 @@ static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max 
 
     std::vector<float> data_f32(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt19937 gen = test_backend_ops_rng();
     std::uniform_real_distribution<float> dis(min, max);
 
     for (int64_t i3 = 0; i3 < ne3; i3++) {
@@ -363,6 +396,17 @@ static double mean_abs_asymm(const float * a, const float * b, const size_t n, c
 
         sum += fabsf(asymm);
         nvalid++;
+    }
+
+    // nvalid == 0 means the grad_expect filter (or an empty tensor) discarded EVERY element, so
+    // this metric compared nothing. sum/nvalid is then 0.0/0 = NaN, and `NaN > max_maa_err()` is
+    // false, so the case would PASS having verified no gradient at all -- the same free-pass class
+    // S1-37 closed for the per-element 0/0. Reachable for CLAMP: if a finite-difference estimate
+    // straddles a bound, its value matches neither expected 0 nor 1 and is filtered out; do that to
+    // all of them and the grad check is vacuous. Return +inf so the case FAILS loudly instead
+    // (an infinite MAA is the visible "compared nothing" signal).
+    if (nvalid == 0) {
+        return INFINITY;
     }
 
     return sum/nvalid;

@@ -179,6 +179,16 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_opt_grad_m(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
     GGML_API struct ggml_tensor * ggml_opt_grad_v(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
 
+    // The global gradient norm from the LAST ggml_opt_eval, before and after clipping. Unlike the
+    // grad-accessor helpers above these are plain scalars cached out of the graph during eval, so
+    // they are valid AFTER it returns. Both are NaN unless that eval ran the OPT graph with
+    // grad_clip > 0: an unclipped run builds no norm node (its graph is unchanged), and a
+    // forward-only or accumulation eval never reaches the optimizer step. When clipping bound, the
+    // post value equals the clip threshold; otherwise post == pre. The post value is measured off
+    // the clipped gradients directly, not inferred from pre times the factor.
+    GGML_API float ggml_opt_grad_norm_pre (ggml_opt_context_t opt_ctx);
+    GGML_API float ggml_opt_grad_norm_post(ggml_opt_context_t opt_ctx);
+
     // The optimizer's iteration counter, which drives AdamW's bias correction (beta1h, beta2h).
     // Restoring the moments without restoring this corrects them for the wrong iteration.
     GGML_API int64_t ggml_opt_get_iter(ggml_opt_context_t opt_ctx);
