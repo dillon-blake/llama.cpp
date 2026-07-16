@@ -9437,6 +9437,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                               /*n_head=*/ 2, /*n_group=*/ 1,
                                               /*n_seq_tokens=*/ 3, /*n_seqs=*/ 2)); // Mamba-2, grad
 
+    // learning-llamas (B-10): TINY n_group > 1 gradient shapes.
+    //
+    // The kernel routes heads to per-group dB/dC slabs via g = h/(nh/ng) and folds every head of a
+    // group into one slab -- a GQA-style sum. At n_group == 1 that collapses (g == 0 for every head)
+    // and the fold is never exercised, so the two n_group == 1 cases above prove nothing about the
+    // routing. These do: n_head/n_group == 2, so each group's dB/dC accumulates TWO heads, and a
+    // routing that summed the wrong heads (or forgot to sum) disagrees with the finite difference.
+    // Both A branches need their own case: head_dim == 1 is A-per-state (Mamba-1), head_dim > 1 is
+    // scalar-A-per-head (Mamba-2), and the group index is computed identically in each.
+    //
+    // ngrads (s+x+dt+B+C) is a few hundred elements -- far below grad_nmax() (10000) -- so unlike
+    // the fixture-scale n_group > 1 cases below, MODE_GRAD actually COMPARES these instead of
+    // skipping them. Dims and the recurrence length (n_seq_tokens) are kept small because dA is
+    // exp(dt_sp*A) and a finite difference of an exponential recurrence amplifies its own rounding.
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, /*d_state=*/ 8, /*head_dim=*/ 1,
+                                              /*n_head=*/ 4, /*n_group=*/ 2,
+                                              /*n_seq_tokens=*/ 4, /*n_seqs=*/ 2)); // Mamba-1, ng=2
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, /*d_state=*/ 8, /*head_dim=*/ 2,
+                                              /*n_head=*/ 4, /*n_group=*/ 2,
+                                              /*n_seq_tokens=*/ 4, /*n_seqs=*/ 2)); // Mamba-2, ng=2
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, /*d_state=*/ 6, /*head_dim=*/ 1,
+                                              /*n_head=*/ 8, /*n_group=*/ 4,
+                                              /*n_seq_tokens=*/ 4, /*n_seqs=*/ 2)); // Mamba-1, ng=4
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, /*d_state=*/ 6, /*head_dim=*/ 2,
+                                              /*n_head=*/ 8, /*n_group=*/ 4,
+                                              /*n_seq_tokens=*/ 4, /*n_seqs=*/ 2)); // Mamba-2, ng=4
+
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 32, 4)); // Mamba-2
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 256, 64,  8, 2, 32, 4)); // Falcon-H1

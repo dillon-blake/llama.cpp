@@ -7474,16 +7474,15 @@ static void ggml_compute_backward(
             GGML_ASSERT(!need_A && "SSM A-matrix gradients are not implemented (ROADMAP E8)");
 
             if (need_s || need_x || need_dt || need_B || need_C) {
-                // n_group is ssm_B->ne[1]. The kernel routes heads to per-group dB/dC slabs via
-                // g = h/(nh/ng), and that routing has NO finite-difference oracle: every grad-
-                // enabled SSM_SCAN case in test-backend-ops is n_group == 1 (the n_group > 1 shapes
-                // exceed grad_nmax and are skipped). Mamba-1 always builds n_group == 1, and the
-                // learning-llamas Mamba-1 e2e (S1-47) verifies that path against a float64 oracle.
-                // n_group > 1 (real Mamba-2 / Falcon-H1) is refused here rather than trained on an
-                // unverified gradient -- see tickets/backlog for the group-index grad oracle.
-                GGML_ASSERT(ssm_B->ne[1] == 1 &&
-                    "SSM_SCAN backward with n_group > 1 has no gradient oracle yet; refusing to "
-                    "train it (learning-llamas S1-47). Mamba-1 (n_group == 1) is verified.");
+                // n_group is ssm_B->ne[1]. The kernel routes each head to its group's B/C row via
+                // g = h/(nh/ng) and folds every head of a group back into one dB/dC slab (a GQA-
+                // style sum). B-10 gave that routing its finite-difference oracle -- tiny n_group in
+                // {2, 4} cases in test-backend-ops, both A branches, plus a float64 group-routing
+                // reference -- so n_group > 1 (Mamba-2 / Falcon-H1) is trained here now, where S1-47
+                // refused it for want of that oracle. The only shape the fold requires is that the
+                // heads divide evenly among the groups.
+                GGML_ASSERT(ssm_x->ne[1] % ssm_B->ne[1] == 0 &&
+                    "SSM_SCAN backward requires n_head to be a multiple of n_group");
 
                 struct ggml_tensor * gb = ggml_ssm_scan_back(
                         ctx, grad, ssm_s, ssm_x, ssm_dt, ssm_A, ssm_B, ssm_C, ssm_id);
