@@ -186,6 +186,10 @@ extern "C" {
     // forward-only or accumulation eval never reaches the optimizer step. When clipping bound, the
     // post value equals the clip threshold; otherwise post == pre. The post value is measured off
     // the clipped gradients directly, not inferred from pre times the factor.
+    //
+    // Valid with static and dynamic graphs alike: with static graphs the two scalars are allocated
+    // in the optimizer's own buffer, beside the loss, precisely so that reading them back does not
+    // depend on which graph copy the scheduler ran.
     GGML_API float ggml_opt_grad_norm_pre (ggml_opt_context_t opt_ctx);
     GGML_API float ggml_opt_grad_norm_post(ggml_opt_context_t opt_ctx);
 

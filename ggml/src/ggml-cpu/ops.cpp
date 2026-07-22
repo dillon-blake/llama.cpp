@@ -4594,6 +4594,16 @@ static void ggml_compute_forward_out_prod_id_grp_f32(
                 // would make the backward disagree with the forward about which expert each slot
                 // chose, and credit the wrong experts. Silently.
                 const int32_t e_i = *(const int32_t *) (ids_t + i*src2->nb[0]);
+
+                // Same range check as OUT_PROD_ID, and it has to be the same one. Without it an
+                // id outside [0, n_expert) simply matches no `e`, so its slot's contribution to
+                // d(as) is dropped -- while the SIBLING half of the very same MUL_MAT_ID backward
+                // aborts on it. One corrupted ids tensor would then abort d(b) and train on a
+                // silently wrong d(as), which is the worst of the two behaviours and the hardest
+                // to attribute. (The forward's own check is a plain `assert`, compiled out in
+                // release; a gradient path does not get to be quieter than that.)
+                GGML_ASSERT(e_i >= 0 && e_i < (int32_t) n_expert);
+
                 if (e_i != (int32_t) e) {
                     continue;
                 }
@@ -4829,7 +4839,20 @@ static void ggml_compute_forward_glu_back_f32(
         //
         // src0/src1/dst keep their contiguity asserts -- their rows are walked as float arrays and
         // a strided read there is unrepresentable, not merely wrong.
-        const char * dy_row = (const char *) grad->data + r*grad->nb[1];
+        //
+        // And because grad carries NO contiguity assert, r must be decomposed rather than folded
+        // into nb[1]. `r` counts rows across ne[1]*ne[2]*ne[3]; r*nb[1] is only the right byte
+        // offset when nb[2] == ne[1]*nb[1], which is exactly what ggml_is_contiguous_1 guarantees
+        // for src0/src1/dst and what nothing guarantees for grad. For a transposed 3-D grad of a
+        // contiguous [p,q,s] the row (i1,i2) lives at i1*nb[1] + i2*nb[2], while the folded form
+        // computes (i1 + i2*p)*4 -- wrong for every i2 > 0 as soon as q > 1. No llama graph builds
+        // a 3-D GLU gradient today, so this is latent, not observed; it is fixed rather than
+        // asserted away because the transposed-grad trap it belongs to has already bitten this
+        // kernel once.
+        const int64_t i1 = r % grad->ne[1];
+        const int64_t i2 = (r / grad->ne[1]) % grad->ne[2];
+        const int64_t i3 = r / (grad->ne[1]*grad->ne[2]);
+        const char * dy_row = (const char *) grad->data + i1*grad->nb[1] + i2*grad->nb[2] + i3*grad->nb[3];
 
         // Where the two halves live, and where their gradients go. For a fused input both halves
         // sit in src0 and `swapped` says which is the gate; for a split input they are src0 and
@@ -10218,7 +10241,18 @@ static void ggml_compute_forward_ssm_scan_back_f32(
     ggml_barrier(params->threadpool);
 
     // Per-thread scratch: n_t + 1 stored states, plus one slot for the running ds.
+    //
+    // Sized by ggml_graph_plan for MIN(ns, n_tasks) slabs, NOT one per thread, so this guard is
+    // load-bearing rather than defensive. `nth` here is the whole threadpool -- ggml gives every
+    // thread the graph-wide count, not the node's n_tasks -- and the loop below is partitioned by
+    // sequence, so at ns == 1 with 16 threads fifteen threads would otherwise compute a slab
+    // address up to fifteen slabs past the end of the work buffer. Leaving early is safe here and
+    // nowhere else: the only barrier in this kernel is the one above, and every output this thread
+    // would have touched belongs to a sequence it does not own.
     const int64_t state_sz = nc*nr*nh;
+    if (ith >= ns) {
+        return;
+    }
     float * scratch = (float *) params->wdata + (size_t) ith*state_sz*(nt + 2);
     float * states  = scratch;
     float * ds      = scratch + (nt + 1)*state_sz;

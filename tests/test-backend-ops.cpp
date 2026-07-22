@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <cerrno>
 #include <cfloat>
 #include <cinttypes>
 #include <cstdarg>
@@ -54,10 +55,25 @@
 // GGML_TEST_SEED makes tensor initialization reproducible run to run (S1-50). Unset (the default)
 // returns -1 and every init site keeps its std::random_device behavior, so nothing changes unless a
 // caller explicitly asks for a seed. The env is read exactly once.
+//
+// A malformed value is FATAL rather than coerced. strtoll maps "abc" to 0 and any negative number
+// to the sentinel that means "unset", so the two most likely typos in the one variable whose entire
+// job is reproducibility both yield a plausible-looking run that reproduces nothing -- and the run
+// says nothing about it. There is no safe guess to make here, so none is made.
 static int64_t test_backend_ops_seed() {
     static const int64_t seed = []() -> int64_t {
         const char * env = getenv("GGML_TEST_SEED");
-        return (env && *env) ? (int64_t) strtoll(env, nullptr, 10) : -1;
+        if (!env || !*env) {
+            return -1;
+        }
+        char * end = nullptr;
+        errno = 0;
+        const long long parsed = strtoll(env, &end, 10);
+        if (errno != 0 || end == env || *end != '\0' || parsed < 0) {
+            fprintf(stderr, "error: GGML_TEST_SEED=\"%s\" is not a non-negative decimal integer\n", env);
+            exit(1);
+        }
+        return (int64_t) parsed;
     }();
     return seed;
 }
@@ -1843,6 +1859,11 @@ struct test_case {
         }
 
 
+        // The op this case is ABOUT, captured before grad_loss wraps `out` in the SUM objective --
+        // after which op_desc(out) is "SUM" for almost every case in the file. Only the
+        // GGML_TEST_MAA_REPORT lines below use it, and they would be useless keyed on "SUM".
+        const std::string maa_op_name = op_desc(out);
+
         if (!ggml_is_scalar(out)) {
             out = grad_loss(ctx.get(), out);
             ggml_set_name(out, "sum_of_out");
@@ -2022,6 +2043,41 @@ struct test_case {
             }
 
             const double err = mean_abs_asymm(gn.data(), ga.data(), gn.size(), expect);
+
+            // learning-llamas (S1-50): EVERY comparison, not only the failing ones.
+            //
+            // The MODE_GRAD bounds in this file are set from a measured distribution -- "worst
+            // 0.0090, p99 0.0081, median 0.0030 over 450 comparisons" and its siblings below --
+            // and until now producing one meant hand-patching this line. A number that cannot be
+            // re-derived by the reader it is written for is a number that rots silently, and the
+            // first thing anyone re-measuring needs is the DISTRIBUTION, not the one draw that
+            // happened to trip the threshold.
+            //
+            // Off unless GGML_TEST_MAA_REPORT is set, so nothing about a normal run changes. Pair
+            // it with GGML_TEST_SEED to see what the pinned draw actually measures -- ONE PROCESS
+            // PER OP, because that is how CI drives it and the seeded stream is invocation-shaped
+            // (the counter is per-process and only matching cases consume from it, so `-o A,B`
+            // gives A different inputs than `-o A` does):
+            //
+            //   ops="SWIGLU GEGLU REGLU GEGLU_ERF GEGLU_QUICK SWIGLU_OAI"
+            //   ops="$ops SSM_SCAN MUL_MAT_ID ADD_ID CROSS_ENTROPY_LOSS_SPARSE"
+            //   for op in $ops; do
+            //       GGML_TEST_MAA_REPORT=1 GGML_TEST_SEED=20260716 test-backend-ops grad -b CPU
+            //           -o "$op" 2>>seeded.tsv >/dev/null    # (one line)
+            //   done
+            //
+            // Drop GGML_TEST_SEED and loop N times for the unseeded distribution. The full recipe,
+            // and the numbers the 2026-07-22 sweep produced, are in
+            // docs/dev/backward-coverage.md ("Re-measuring a max_maa_err() bound").
+            //
+            // Note the VARIANT names, not "GLU" -- `-o` matches op_desc(out) exactly, and a
+            // GGML_OP_GLU node reports SWIGLU/GEGLU/..., so `-o GLU` matches zero cases and exits 0
+            // having run nothing. That is a real trap this repo has fallen into twice.
+            if (getenv("GGML_TEST_MAA_REPORT")) {
+                fprintf(stderr, "MAA\t%s\t%s\t%s\t%.6g\t%.6g\n",
+                        maa_op_name.c_str(), vars().c_str(), t->name, err, max_maa_err());
+            }
+
             if (err > max_maa_err()) {
                 test_operation_info info(op_desc(out), vars(), ggml_backend_name(backend));
                 info.set_maa_error(err, max_maa_err());
@@ -2253,30 +2309,6 @@ struct test_glu : public test_case {
             bool swapped = false)
         : op(op), type(type), ne_a(ne_a), v(v), swapped(swapped) {}
 
-    // MEASURED, and its LIMITS stated -- because this bound is loose and pretending otherwise
-    // would be worse than the bound itself.
-    //
-    //   worst FD noise, 5+ runs, all variants        0.038 - 0.10
-    //   drop act'(x) from dx                         0.53
-    //   drop act(x)  from dg                         0.39
-    //   use act(x) where g belongs in dx             4.51
-    //   GEGLU_QUICK: drop the second derivative term 2.16
-    //   SWIGLU_OAI:  drop the (y+1) factor           3.64
-    //
-    // 0.15 catches every STRUCTURAL defect by 2.6-30x. It does NOT catch a subtle one: perturbing
-    // GEGLU's tanh argument by 5% measures 0.062, which is inside the noise. So MODE_GRAD is a
-    // wiring check for this op, not a numerics check, and it is important to say so.
-    //
-    // WHY THE NOISE IS IRREDUCIBLE. dx = dy * g * act'(x), and `g` is uniformly initialized, so
-    // elements with g ~ 0 exist at ANY range -- and mean_abs_asymm divides by (gn + ga), not by
-    // (|gn| + |ga|), so a near-zero gradient sends that ratio to infinity. Narrowing the init range
-    // does not help (measured at +/-4, +/-2 and +/-1.5: 0.038, 0.10, 0.031). Unlike MUL_MAT_ID,
-    // this op cannot be conditioned out of it: the gradient is elementwise, so there are no extra
-    // terms to sum over.
-    //
-    // The derivatives themselves are therefore checked against a DOUBLE-PRECISION reference of
-    // ggml's own scalar forwards -- exactly, to ~1e-7 -- rather than through this metric. That is
-    // the oracle that would catch a wrong coefficient; this one would not.
     // MEASURED (S1-28 + S1-37), with numbers on both sides:
     //
     //   worst FD noise, 15 runs                0.022
@@ -2289,6 +2321,32 @@ struct test_glu : public test_case {
     //
     // 5e-2 sits 2.3x above the noise and 3.6-90x below every real defect. Six mutations injected,
     // six caught.
+    //
+    // RE-MEASURED S1-50, Linux x86-64 / Intel N100, 15 unseeded runs, every case and every param
+    // instrumented rather than only the failing ones: worst 0.0090, p99 0.0081, median 0.0030 over
+    // 450 comparisons. Below the 0.022 above, so the bound stands unchanged -- quoted because the
+    // two sibling classes were re-measured in the same sweep and their numbers belong next to this
+    // one. A second 15-run sweep reproduced it: 0.0096 / 0.0173 / 0.0184 worst for
+    // test_glu / test_glu_split / test_swiglu_oai.
+    //
+    // ...AND THE PINNED DRAW, which is the only one CI ever sees, and which the sweeps above do
+    // not contain. Every MODE_GRAD step in .github/workflows/* sets GGML_TEST_SEED=20260716, so
+    // each case gets ONE fixed input forever: a marginal draw is not a flake there, it is a
+    // permanent red -- or a permanently invisible defect. Measured under CI's exact invocation
+    // shape (`grad -b CPU -o <one op>`, one process per op, as tests/test_backend_ops_grad.py runs
+    // it), with GGML_TEST_MAA_REPORT=1:
+    //
+    //   test_glu          worst 0.0054   9.2x under the bound    30 comparisons
+    //   test_glu_split    worst 0.0146   3.4x                    20
+    //   test_swiglu_oai   worst 0.0144   3.5x                    16
+    //
+    // Both regimes are recorded because they answer different questions. A failure at or near the
+    // unseeded worst is a bound-vs-noise problem and belongs in the table above; a failure that
+    // appears after any change to the NUMBER OR ORDER of seeded draws is a seed shift and says
+    // nothing about the kernel. The counter is per-process and consumed in call order, so the draw
+    // is invocation-shaped -- verified: SSM_SCAN's inputs differ between `-o SSM_SCAN` and
+    // `-o ...,SSM_SCAN,...`, while two identical invocations are bit-identical. Quote the shape
+    // with the number, or the number cannot be reproduced.
     //
     // This bound was 0.9 -- i.e. meaningless -- until S1-37 fixed mean_abs_asymm to divide by
     // |gn| + |ga| rather than the signed sum. Before that the "noise" reached 1.80 while a broken
@@ -2361,8 +2419,7 @@ struct test_glu : public test_case {
                 // The EVAL sweep keeps [-150, 150]: it is hunting NaNs in GELU's tails, which is a
                 // different job with the opposite requirement.
                 std::vector<float> v(ggml_nelements(t));
-                std::random_device rd;
-                std::default_random_engine rng(rd());
+                std::mt19937 rng = test_backend_ops_rng();
                 std::uniform_real_distribution<float> mag(0.5f, 1.5f);
                 std::uniform_int_distribution<int>    sgn(0, 1);
                 for (auto & x : v) {
@@ -2393,58 +2450,47 @@ struct test_glu_split : public test_case {
             int v = 0)
         : op(op), type(type), ne_a(ne_a), v(v) {}
 
-    // MEASURED, and its LIMITS stated -- because this bound is loose and pretending otherwise
-    // would be worse than the bound itself.
-    //
-    //   worst FD noise, 5+ runs, all variants        0.038 - 0.10
-    //   drop act'(x) from dx                         0.53
-    //   drop act(x)  from dg                         0.39
-    //   use act(x) where g belongs in dx             4.51
-    //   GEGLU_QUICK: drop the second derivative term 2.16
-    //   SWIGLU_OAI:  drop the (y+1) factor           3.64
-    //
-    // 0.15 catches every STRUCTURAL defect by 2.6-30x. It does NOT catch a subtle one: perturbing
-    // GEGLU's tanh argument by 5% measures 0.062, which is inside the noise. So MODE_GRAD is a
-    // wiring check for this op, not a numerics check, and it is important to say so.
-    //
-    // WHY THE NOISE IS IRREDUCIBLE. dx = dy * g * act'(x), and `g` is uniformly initialized, so
-    // elements with g ~ 0 exist at ANY range -- and mean_abs_asymm divides by (gn + ga), not by
-    // (|gn| + |ga|), so a near-zero gradient sends that ratio to infinity. Narrowing the init range
-    // does not help (measured at +/-4, +/-2 and +/-1.5: 0.038, 0.10, 0.031). Unlike MUL_MAT_ID,
-    // this op cannot be conditioned out of it: the gradient is elementwise, so there are no extra
-    // terms to sum over.
-    //
-    // The derivatives themselves are therefore checked against a DOUBLE-PRECISION reference of
-    // ggml's own scalar forwards -- exactly, to ~1e-7 -- rather than through this metric. That is
-    // the oracle that would catch a wrong coefficient; this one would not.
     double max_maa_err() override {
-        // MODE_GRAD IS A WIRING CHECK FOR THIS OP, NOT A NUMERICS CHECK. Saying so plainly,
-        // because a tolerance this wide would otherwise read as a passing test that means something.
+        // Measured (S1-28 + S1-37), with numbers on both sides:
         //
-        // Measured, with the kernel verified exact (~1e-7) against a float64 reference throughout:
+        //   worst FD noise, 15 runs                0.022
+        //   drop act'(x) from dx                   0.52
+        //   drop act(x)  from dg                   0.59
+        //   use act(x) where g belongs in dx       4.51
+        //   GEGLU_QUICK: drop the 2nd deriv term   0.54
+        //   SWIGLU_OAI:  drop the (y+1) factor     0.60
+        //   SWIGLU:      drop the x(1-s) term      0.18
         //
-        //   FD noise, 12 runs, conditioned init   up to 0.80
-        //   drop act'(x) from dx                       0.52
-        //   drop act(x)  from dg                       0.59
-        //   SWIGLU: drop the x(1-s) term               0.18
+        // Same floor and the same catalogue as the fused test_glu above, and necessarily so: the
+        // split form differs only in which tensor each half is read from, so every gradient element
+        // and therefore every MAA term is the one the fused case computes. 5e-2 sits 2.3x above the
+        // noise and 3.6-90x below every real defect.
         //
-        // The noise OVERLAPS the defects. No tolerance separates them, so none is chosen: this
-        // bound only asserts the backward builds, schedules, produces the right shapes and does not
-        // abort -- all of which used to be impossible, since REGLU/GEGLU/GEGLU_ERF/GEGLU_QUICK/
-        // SWIGLU_OAI hit GGML_ABORT and fused SwiGLU tripped an assert.
+        // The inheritance is no longer only an argument: MEASURED S1-50 on this class directly,
+        // Linux x86-64 / Intel N100, 15 unseeded runs with every case and every param instrumented
+        // -- worst 0.0151, p99 0.0136, median 0.00012 over 300 comparisons. 5e-2 is 3.3x that
+        // worst, and 12x below the weakest catalogued defect (0.18). A second 15-run sweep put the
+        // worst at 0.0173 (2.9x), so this is the noisiest tail of the three GLU classes bar
+        // SWIGLU_OAI, and 3x is about all the margin there is.
         //
-        // WHY IT CANNOT BE FIXED HERE. mean_abs_asymm divides by (gn + ga), not (|gn| + |ga|), so a
-        // near-zero gradient element sends the ratio to infinity -- and every GLU gradient is a
-        // PRODUCT (dx = dy * g * act'(x)), so near-zero elements are ordinary, not exotic.
-        // Correcting the metric to |gn| + |ga| drops the noise floor to 0.022 and makes every
-        // defect above catchable with 3.6-12x margin. That change is written and measured, and it
-        // is NOT in this commit: it also removes a NaN-based free pass that TANH, SIGMOID and
-        // CROSS_ENTROPY_LOSS have been relying on since S1-19 (0/0 = NaN, and `NaN > tol` is
-        // false, so they passed unconditionally). Fixing those is its own ticket -- S1-37.
+        // Under CI's pinned GGML_TEST_SEED=20260716 the single fixed draw measures 0.0146 (3.4x)
+        // over 20 comparisons. See test_glu::max_maa_err for why both regimes are written down and
+        // how to reproduce either.
         //
-        // The NUMERICS are checked by tests/test-glu-back.cpp, which differentiates ggml's own
-        // scalar forwards in float64 and matches all six variants to ~1e-7. That is the oracle.
-        return 0.9;
+        // This bound was 0.9 until S1-50 -- i.e. it could not fail. The old comment here described
+        // a pre-S1-37 world: the metric divided by the SIGNED sum (gn + ga), a near-zero gradient
+        // element sent that ratio to infinity, and since every GLU gradient is a product
+        // (dx = dy * g * act'(x)) such elements are ordinary. The "noise" reached 0.80 while a
+        // broken kernel measured 0.18, the two OVERLAPPED, and no tolerance was safe. S1-37 fixed
+        // mean_abs_asymm to divide by |gn| + |ga| and the overlap went away -- but only the fused
+        // case's bound was tightened with it, leaving 0.9 sitting above every catalogued mutation
+        // (0.18 to 0.60) on this one.
+        //
+        // The NUMERICS -- a wrong coefficient rather than a wrong structure -- are still checked by
+        // tests/test-glu-back.cpp, which differentiates ggml's own scalar forwards in float64 and
+        // matches all six variants to ~1e-7. A 5% error in GEGLU's tanh argument is sub-noise here
+        // and fails there instantly.
+        return 5e-2;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -2464,7 +2510,7 @@ struct test_glu_split : public test_case {
             ggml_set_name(b, "b");
 
             b = ggml_view_4d(ctx, b, ne_a[0], ne_a[1], ne_a[2], ne_a[3], b->nb[1], b->nb[2], b->nb[3], 0);
-            ggml_set_name(a, "view_of_b");
+            ggml_set_name(b, "view_of_b");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
             ggml_set_param(a);
@@ -2503,8 +2549,7 @@ struct test_glu_split : public test_case {
                 // The EVAL sweep keeps [-150, 150]: it is hunting NaNs in GELU's tails, which is a
                 // different job with the opposite requirement.
                 std::vector<float> v(ggml_nelements(t));
-                std::random_device rd;
-                std::default_random_engine rng(rd());
+                std::mt19937 rng = test_backend_ops_rng();
                 std::uniform_real_distribution<float> mag(0.5f, 1.5f);
                 std::uniform_int_distribution<int>    sgn(0, 1);
                 for (auto & x : v) {
@@ -2537,58 +2582,49 @@ struct test_swiglu_oai : public test_case {
                     float limit = 7.0f)
         : type(type), ne_a(ne_a), v(v), alpha(alpha), limit(limit) {}
 
-    // MEASURED, and its LIMITS stated -- because this bound is loose and pretending otherwise
-    // would be worse than the bound itself.
-    //
-    //   worst FD noise, 5+ runs, all variants        0.038 - 0.10
-    //   drop act'(x) from dx                         0.53
-    //   drop act(x)  from dg                         0.39
-    //   use act(x) where g belongs in dx             4.51
-    //   GEGLU_QUICK: drop the second derivative term 2.16
-    //   SWIGLU_OAI:  drop the (y+1) factor           3.64
-    //
-    // 0.15 catches every STRUCTURAL defect by 2.6-30x. It does NOT catch a subtle one: perturbing
-    // GEGLU's tanh argument by 5% measures 0.062, which is inside the noise. So MODE_GRAD is a
-    // wiring check for this op, not a numerics check, and it is important to say so.
-    //
-    // WHY THE NOISE IS IRREDUCIBLE. dx = dy * g * act'(x), and `g` is uniformly initialized, so
-    // elements with g ~ 0 exist at ANY range -- and mean_abs_asymm divides by (gn + ga), not by
-    // (|gn| + |ga|), so a near-zero gradient sends that ratio to infinity. Narrowing the init range
-    // does not help (measured at +/-4, +/-2 and +/-1.5: 0.038, 0.10, 0.031). Unlike MUL_MAT_ID,
-    // this op cannot be conditioned out of it: the gradient is elementwise, so there are no extra
-    // terms to sum over.
-    //
-    // The derivatives themselves are therefore checked against a DOUBLE-PRECISION reference of
-    // ggml's own scalar forwards -- exactly, to ~1e-7 -- rather than through this metric. That is
-    // the oracle that would catch a wrong coefficient; this one would not.
     double max_maa_err() override {
-        // MODE_GRAD IS A WIRING CHECK FOR THIS OP, NOT A NUMERICS CHECK. Saying so plainly,
-        // because a tolerance this wide would otherwise read as a passing test that means something.
+        // Measured (S1-28 + S1-37) on the GLU family, with numbers on both sides:
         //
-        // Measured, with the kernel verified exact (~1e-7) against a float64 reference throughout:
+        //   worst FD noise, 15 runs                0.022
+        //   drop act'(x) from dx                   0.52
+        //   drop act(x)  from dg                   0.59
+        //   use act(x) where g belongs in dx       4.51
+        //   SWIGLU_OAI:  drop the (y+1) factor     0.60
         //
-        //   FD noise, 12 runs, conditioned init   up to 0.80
-        //   drop act'(x) from dx                       0.52
-        //   drop act(x)  from dg                       0.59
-        //   SWIGLU: drop the x(1-s) term               0.18
+        // The 0.022 floor is the fused test_glu's, over the five non-OAI variants; OAI is not in
+        // that sample, and the reason it inherits the number is worth stating rather than assuming.
+        // The floor is set by gradient elements near zero, since MAA scores those on rounding.
+        // OAI's dx = [x<limit]*(s + alpha*x'*s*(1-s))*(y'+1) has one near-zero source the others do
+        // not: y' ~ -1. The conditioned init draws |y'| in [0.5, 1.5] with random sign, so y' + 1
+        // does reach zero -- but MAA only blows up on an element once its true gradient falls below
+        // the finite difference's own resolution (~1e-6 of the tensor scale at grad_eps 0.1 in
+        // float32), which needs |y' + 1| ~ 1e-6, i.e. a ~1e-6 slice of the init range. That is
+        // three orders of magnitude too rare to move a mean over 1024 elements. The zero crossing
+        // of silu' at x ~ -1.278, which IS inside the init range and IS in the 0.022 sample,
+        // dominates it.
         //
-        // The noise OVERLAPS the defects. No tolerance separates them, so none is chosen: this
-        // bound only asserts the backward builds, schedules, produces the right shapes and does not
-        // abort -- all of which used to be impossible, since REGLU/GEGLU/GEGLU_ERF/GEGLU_QUICK/
-        // SWIGLU_OAI hit GGML_ABORT and fused SwiGLU tripped an assert.
+        // That argument has since been checked against OAI's own numbers rather than left as an
+        // inference: MEASURED S1-50, Linux x86-64 / Intel N100, 15 unseeded runs with every case
+        // and every param instrumented -- worst 0.0199, p99 0.0174, median 0.00010 over 240
+        // comparisons. Slightly the noisiest of the three classes, as the (y'+1) reasoning
+        // predicts, and still 2.5x under 5e-2 and 30x under the weakest catalogued defect (0.60).
+        // A second 15-run sweep agreed: worst 0.0184 (2.7x).
         //
-        // WHY IT CANNOT BE FIXED HERE. mean_abs_asymm divides by (gn + ga), not (|gn| + |ga|), so a
-        // near-zero gradient element sends the ratio to infinity -- and every GLU gradient is a
-        // PRODUCT (dx = dy * g * act'(x)), so near-zero elements are ordinary, not exotic.
-        // Correcting the metric to |gn| + |ga| drops the noise floor to 0.022 and makes every
-        // defect above catchable with 3.6-12x margin. That change is written and measured, and it
-        // is NOT in this commit: it also removes a NaN-based free pass that TANH, SIGMOID and
-        // CROSS_ENTROPY_LOSS have been relying on since S1-19 (0/0 = NaN, and `NaN > tol` is
-        // false, so they passed unconditionally). Fixing those is its own ticket -- S1-37.
+        // Under CI's pinned GGML_TEST_SEED=20260716 the single fixed draw measures 0.0144 (3.5x)
+        // over 16 comparisons -- inside the unseeded spread, not at its edge. See
+        // test_glu::max_maa_err for why both regimes are written down and how to reproduce either.
         //
-        // The NUMERICS are checked by tests/test-glu-back.cpp, which differentiates ggml's own
-        // scalar forwards in float64 and matches all six variants to ~1e-7. That is the oracle.
-        return 0.9;
+        // This bound was 0.9 until S1-50 -- i.e. it could not fail, sitting above every catalogued
+        // mutation. The old comment here described a pre-S1-37 world: the metric divided by the
+        // SIGNED sum (gn + ga), so a near-zero element sent the ratio to infinity, the "noise"
+        // reached 0.80 while a broken kernel measured 0.18, and no tolerance separated them. S1-37
+        // fixed mean_abs_asymm to divide by |gn| + |ga|; only the fused case's bound was tightened
+        // with it.
+        //
+        // The NUMERICS -- a wrong coefficient rather than a wrong structure -- are still checked by
+        // tests/test-glu-back.cpp, which differentiates ggml's own scalar forwards in float64 and
+        // matches all six variants to ~1e-7. That is the oracle; this is the wiring check.
+        return 5e-2;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -2608,7 +2644,7 @@ struct test_swiglu_oai : public test_case {
             ggml_set_name(b, "b");
 
             b = ggml_view_4d(ctx, b, ne_a[0], ne_a[1], ne_a[2], ne_a[3], b->nb[1], b->nb[2], b->nb[3], 0);
-            ggml_set_name(a, "view_of_b");
+            ggml_set_name(b, "view_of_b");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
             ggml_set_param(a);
@@ -2647,8 +2683,7 @@ struct test_swiglu_oai : public test_case {
                 // The EVAL sweep keeps [-150, 150]: it is hunting NaNs in GELU's tails, which is a
                 // different job with the opposite requirement.
                 std::vector<float> v(ggml_nelements(t));
-                std::random_device rd;
-                std::default_random_engine rng(rd());
+                std::mt19937 rng = test_backend_ops_rng();
                 std::uniform_real_distribution<float> mag(0.5f, 1.5f);
                 std::uniform_int_distribution<int>    sgn(0, 1);
                 for (auto & x : v) {
@@ -3713,8 +3748,7 @@ struct test_add_id : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
-                std::random_device rd;
-                std::default_random_engine rng(rd());
+                std::mt19937 rng = test_backend_ops_rng();
                 // ids
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<int32_t> data(t->ne[0]);
@@ -4399,6 +4433,19 @@ struct test_ssm_scan : public test_case {
     // caught -- at either threshold. The noise is high because the recurrence is EXPONENTIAL in
     // dt*A: a finite difference of it amplifies its own rounding, which is exactly why the float64
     // reference above is the oracle and this is the wiring-plus-sanity check.
+    //
+    // BOTH REGIMES, measured on this box with GGML_TEST_MAA_REPORT=1 (see test_glu::max_maa_err
+    // for why both, and why the invocation shape has to be quoted with the number):
+    //
+    //   unseeded, 15 runs of `grad -b CPU -o SSM_SCAN`   worst 0.0148, p99 0.0038, median 9.5e-6
+    //                                                    over 450 comparisons  (6.8x under 1e-1)
+    //   pinned,   GGML_TEST_SEED=20260716, same shape    worst 0.0010  over 30  (98x)
+    //
+    // The pinned draw is 14x quieter than the unseeded tail, which is the thing to remember when
+    // this case does fail in CI: at 98x margin it is not going to be a marginal draw, so a red
+    // here means either a real defect or a seed shift -- not noise. The unseeded worst is what a
+    // local run has to clear, and 0.0148 against 1e-1 is why the MSVC 0.0558 draw was a widened
+    // floor rather than a bug.
     double max_maa_err() override {
         return 1e-1;
     }
@@ -4462,8 +4509,7 @@ struct test_ssm_scan : public test_case {
 
     // similar to test_mul_mat_id
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        std::mt19937 rng = test_backend_ops_rng();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
@@ -4817,8 +4863,7 @@ struct test_mul_mat_hadamard : public test_mul_mat {
 };
 
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
-    std::random_device rd;
-    std::default_random_engine rng(rd());
+    std::mt19937 rng = test_backend_ops_rng();
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type == GGML_TYPE_I32) {
             if (ggml_is_view_op(t->op)) { continue; }
@@ -5573,6 +5618,22 @@ struct test_soft_max : public test_case {
     // 5e-3 is set from the measured worst case (1.9e-3) with headroom, and it is still two orders of
     // magnitude tighter than any real defect: a missing term, a transposition or a mis-scaling
     // produces an MAA of order 1, not of order 1e-3.
+    //
+    // THAT 1.9e-3 IS NOT THE TAIL, and the difference matters now that CI pins the draw.
+    // Instrumented (GGML_TEST_MAA_REPORT=1), 15 unseeded runs of `grad -b CPU -o SOFT_MAX`: 1185
+    // comparisons, median 2.7e-5, p99 5.2e-4 -- and worst 5.35e-3, i.e. ONE comparison over the
+    // bound, one failing run in fifteen. The offender is
+    // ne=[15,15,1,1],mask=1,sinks=1,scale=0.1,max_bias=8, the smallest-scale ALiBi+sink case, which
+    // is exactly the configuration the grad_eps note above says is estimator-limited.
+    //
+    // Under CI's pinned GGML_TEST_SEED=20260716 the same sweep is worst 4.65e-4 over 79
+    // comparisons -- a 10.8x margin, permanently. So the seed does not merely make this
+    // reproducible, it decides the outcome: unseeded this case flakes at roughly 1 run in 15, and
+    // seeded it is green forever on a draw 11x quieter than the tail. That is a reason to keep the
+    // seed pinned, and equally a reason not to read a green here as evidence the bound is
+    // comfortable. If this ever goes red, condition the estimator (the float32 difference quotient
+    // at scale=0.1 is the limit, and the float64 check above says the kernel is right to six
+    // figures) rather than raising the number below.
     double max_maa_err() override {
         return 5e-3;
     }
@@ -7556,8 +7617,7 @@ struct test_cross_entropy_loss_sparse : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        std::mt19937 rng = test_backend_ops_rng();
 
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
@@ -7611,7 +7671,17 @@ struct test_cross_entropy_loss_sparse : public test_case {
     // Above the harness default of 1e-4, and only because of float32 estimator noise. The loss
     // is O(1), so its float32 resolution is ~1e-7; a central difference at eps = 0.01 therefore
     // has a noise floor around 1e-5, which is ~3e-4 relative to the ~0.03 gradient entries a
-    // near-uniform softmax produces. Measured MAA sits at 1e-3 to 2e-3, stable across runs.
+    // near-uniform softmax produces.
+    //
+    // "1e-3 to 2e-3, stable across runs" was the earlier note here, and it was measured from the
+    // typical case rather than the tail. Instrumented (GGML_TEST_MAA_REPORT=1), 15 unseeded runs
+    // of `grad -b CPU -o CROSS_ENTROPY_LOSS_SPARSE`: worst 0.0030, p99 0.0029, median 0.0011 over
+    // 90 comparisons -- so the real margin is 1.7x, not the 2.5-5x that range implies, and it is
+    // the tightest in this file. Under CI's pinned GGML_TEST_SEED=20260716 the fixed draw is 0.0028
+    // (1.8x) on ne=[30,5],logit_scale=1,softcap=1,mask=0, which is also the unseeded worst case.
+    // Recorded rather than acted on: the estimator is the thing that is loose (float32 central
+    // difference at eps=0.01), so the fix if this ever goes red is a better-conditioned FD or a
+    // float64 oracle for this case, NOT a bigger number below.
     //
     // The analytic gradient is not merely within tolerance of the estimate; it is MORE accurate
     // than it. Verified independently in float64: for every (logit_scale, softcap) combination
@@ -7657,8 +7727,7 @@ struct test_cross_entropy_loss_sparse_back : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        std::mt19937 rng = test_backend_ops_rng();
 
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
@@ -11192,6 +11261,14 @@ static void usage(char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+    // Read (and validate) GGML_TEST_SEED here, before anything forks a worker: the value is cached
+    // in a function-local static, and a malformed one exits. Diagnosing that from inside a tensor
+    // init running on one of -j worker threads would be needlessly hard.
+    const int64_t test_seed = test_backend_ops_seed();
+    if (test_seed >= 0) {
+        printf("GGML_TEST_SEED=%" PRId64 ": tensor initialization is pinned\n", test_seed);
+    }
+
     test_mode mode = MODE_TEST;
     output_formats output_format = CONSOLE;
     const char * op_names_filter = nullptr;

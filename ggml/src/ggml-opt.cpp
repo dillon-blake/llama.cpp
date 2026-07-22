@@ -344,8 +344,10 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
 
-    // The norm tensors live in the transient compute graph rebuilt below; stale pointers from the
-    // previous step's (freed) graph must never be read. Only the grad_clip>0 branch re-sets them.
+    // With dynamic graphs the norm tensors are rebuilt below along with everything else, and a
+    // stale pointer into the previous step's freed compute context must never be read. (With
+    // static graphs this function runs once, so the clear is a no-op there.) Only the grad_clip>0
+    // branch re-sets them.
     opt_ctx->grad_norm_pre_t  = nullptr;
     opt_ctx->grad_norm_post_t = nullptr;
 
@@ -376,10 +378,18 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         //   - labels (if using static graphs)
         //   - loss (if using static graphs, up to 5 tensors)
         //   - pred (if using static graphs)
-        //   - ncorrect (if using static graphs, 2 tensors).
+        //   - ncorrect (if using static graphs, 2 tensors)
+        //   - the pre/post-clip gradient norms (if using static graphs AND clipping, 2 tensors).
+        //
+        // The norms are counted here for the same reason the loss is: ggml_opt_eval reads them
+        // back with ggml_backend_tensor_get after the compute, which needs a buffer, and on the
+        // static path the graph that actually runs is a dup_graph copy in ctx_copy -- the copy
+        // inherits its data pointer from the original, so the original is what must be allocated.
+        // Left in ctx_compute they would never be allocated at all and the read-back would hit
+        // GGML_ASSERT(buf != NULL) inside ggml_backend_tensor_get.
         constexpr size_t n_loss = 1;
         const size_t tensors_per_param = (accumulate ? 1 : 0) + (need_momenta ? 2 : 0);
-        const size_t tensors_const = opt_ctx->static_graphs ? 9 : 0;
+        const size_t tensors_const = opt_ctx->static_graphs ? (opt_ctx->grad_clip > 0.0f ? 11 : 9) : 0;
         const size_t size_meta = (n_loss + tensors_per_param*n_param + tensors_const) * ggml_tensor_overhead();
         struct ggml_init_params params = {
             /*.mem_size   =*/ size_meta,
@@ -594,7 +604,14 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         }
 
         if (sumsq) {
-            struct ggml_tensor * norm = ggml_sqrt(opt_ctx->ctx_compute, sumsq);
+            // ctx_results, not ctx_compute -- the same context the loss is built in, and for the
+            // same reason. ggml_opt_eval reads this scalar back after the compute, and on the
+            // static-graph path what actually runs is the dup_graph copy in ctx_copy: the copy
+            // inherits data/buffer from the original, so it is the ORIGINAL that has to own a
+            // buffer, and only ctx_static gets one (buf_static). Built in ctx_compute it is
+            // allocated by the scheduler on the dynamic path and by nobody at all on the static
+            // one, where the read-back then aborts in ggml_backend_tensor_get on a NULL buffer.
+            struct ggml_tensor * norm = ggml_sqrt(ctx_results, sumsq);
             ggml_set_name(norm, "grad_norm");
 
             // Keep this scalar readable after the compute (ggml_opt_eval reads it back like the
@@ -665,7 +682,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     // The post-clip global norm, sqrt of the summed clipped-gradient squares. Nothing in the
     // optimizer step consumes it, so expand it into the graph explicitly and pin its buffer.
     if (post_sumsq) {
-        struct ggml_tensor * grad_norm_post = ggml_sqrt(opt_ctx->ctx_compute, post_sumsq);
+        // ctx_results for the same reason as grad_norm above: this one is read back too.
+        struct ggml_tensor * grad_norm_post = ggml_sqrt(ctx_results, post_sumsq);
         ggml_set_name(grad_norm_post, "grad_norm_post");
         ggml_set_output(grad_norm_post);
         ggml_build_forward_expand(opt_ctx->gb_opt, grad_norm_post);

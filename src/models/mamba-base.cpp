@@ -120,9 +120,18 @@ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
             // recomputes the intermediate states from this initial state, so it must read the value
             // the forward saw -- but by backward time the cache holds the *final* state, silently
             // corrupting every scan gradient of every layer but the last. Copy it into its own
-            // buffer so the in-place update cannot reach the backward's input. The copy is small
-            // (one state slab) and only load-bearing on the training path.
-            ssm = ggml_cont(ctx, ssm);
+            // buffer so the in-place update cannot reach the backward's input.
+            //
+            // Gated on training (S1-50), because the copy is NOT small: `ssm` spans the whole
+            // recurrent-state cache -- the reshape is over get_size() slots, not this ubatch's
+            // n_seqs -- so an unconditional ggml_cont costs a cache-sized memcpy and a cache-sized
+            // compute-buffer slab, per layer, per graph evaluation. Inference builds no backward,
+            // and there the scan node is expanded into the graph before the ggml_cpy that
+            // overwrites the cache, so reading the cache directly (as upstream does) is correct and
+            // free. Only the differentiated graph has a live reader of the pre-update value.
+            if (cparams.training) {
+                ssm = ggml_cont(ctx, ssm);
+            }
 
             // Custom operator to optimize the parallel associative scan
             // as described in the Annex D of the Mamba paper.
@@ -257,8 +266,11 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
 
             // learning-llamas (S1-47): copy the initial state out of the in-place-updated recurrent
             // cache so ggml_ssm_scan_back reads the value the forward saw, not the overwritten final
-            // state. Same reasoning as the Mamba-1 path above.
-            ssm = ggml_cont(ctx, ssm);
+            // state. Training only, and the copy is cache-sized rather than ubatch-sized: same
+            // reasoning, at length, on the Mamba-1 path above.
+            if (cparams.training) {
+                ssm = ggml_cont(ctx, ssm);
+            }
 
             // TODO: use semistructured matrices to implement state-space duality
             // => {d_inner, n_seq_tokens, n_seqs} and {d_state, d_inner, n_seqs}

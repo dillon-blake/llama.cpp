@@ -2906,11 +2906,28 @@ struct ggml_cplan ggml_graph_plan(
                         // the backward recomputes and STORES every intermediate state -- n_t + 1 of
                         // them -- plus one slot for the running state-gradient. Per thread, because
                         // each thread owns whole sequences.
+                        //
+                        // MIN(ns, n_tasks) slabs, not n_tasks (S1-50). The kernel partitions
+                        // strictly by sequence -- `for (i3 = ith; i3 < ns; i3 += nth)` -- and
+                        // RETURNS BEFORE FORMING ITS SLAB POINTER when ith >= ns, so the slabs that
+                        // are ever addressed number MIN(ns, nth) and no more. The two sides have to
+                        // be read together: n_tasks is not what the kernel sees as `nth` (that is
+                        // the whole threadpool, cplan.n_threads), so this bound is only sound
+                        // BECAUSE of the guard in ggml_compute_forward_ssm_scan_back_f32 -- remove
+                        // the guard and this becomes an overrun. n_tasks >= cplan.n_threads here,
+                        // so MIN(ns, n_tasks) is never short.
+                        //
+                        // Charging a slab per thread is not conservative, it is unusable: a training
+                        // ubatch has ns == 1, and at d_state 128 / head_dim 64 / n_head 24 /
+                        // n_t 1024 with 16 threads that asks for 12.9 GB to use 0.8 GB -- a
+                        // plan-time OOM for a step that fits the algorithm. Invisible on the tiny
+                        // test fixtures, where the whole buffer is a few MB either way.
                         const struct ggml_tensor * s  = node->src[1];
                         const struct ggml_tensor * x  = node->src[2];
                         const int64_t state_sz = s->ne[0]*s->ne[1]*x->ne[1];
                         const int64_t n_t      = x->ne[2];
-                        cur = ggml_type_size(GGML_TYPE_F32) * state_sz * (n_t + 2) * n_tasks;
+                        const int64_t n_slabs  = MIN((int64_t) n_tasks, x->ne[3]);
+                        cur = ggml_type_size(GGML_TYPE_F32) * state_sz * (n_t + 2) * n_slabs;
                     } break;
                 case GGML_OP_OUT_PROD_ID:
                     {
